@@ -725,7 +725,7 @@ where
                 .ok_or_else(|| Error::ProtocolError("__create__ missing 'guid'".to_string()))?,
         );
 
-        eprintln!(
+        log::debug!(
             "DEBUG __create__: type={}, guid={}, parent_guid={}",
             type_name, object_guid, event.guid
         );
@@ -739,7 +739,7 @@ where
             .get(&event.guid)
             .cloned()
             .ok_or_else(|| {
-                eprintln!(
+                log::debug!(
                     "DEBUG: Parent object not found for type={}, parent_guid={}",
                     type_name, event.guid
                 );
@@ -764,7 +764,7 @@ where
         {
             Ok(obj) => obj,
             Err(e) => {
-                eprintln!(
+                log::debug!(
                     "DEBUG: Failed to create object type={}, guid={}, error={}",
                     type_name, object_guid, e
                 );
@@ -779,7 +779,7 @@ where
         // Register in parent
         parent_obj.add_child(Arc::clone(&object_guid), object);
 
-        eprintln!(
+        log::debug!(
             "DEBUG: Successfully created and registered object: type={}, guid={}",
             type_name, object_guid
         );

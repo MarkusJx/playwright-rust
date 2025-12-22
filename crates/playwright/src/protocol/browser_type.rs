@@ -169,7 +169,7 @@ impl BrowserType {
                 let is_ci = std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok();
 
                 if is_ci {
-                    eprintln!(
+                    log::debug!(
                         "[playwright-rust] Detected Windows CI environment, adding stability flags"
                     );
 
