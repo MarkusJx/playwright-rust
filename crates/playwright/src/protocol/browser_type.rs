@@ -7,7 +7,7 @@
 // - Python: playwright-python/playwright/_impl/_browser_type.py
 // - Protocol: protocol.yml (BrowserType interface)
 
-use crate::api::{ConnectOptions, LaunchOptions};
+use crate::api::{ConnectOptions, ConnectOverCdpOptions, LaunchOptions};
 use crate::error::Result;
 use crate::protocol::{Browser, BrowserContext, BrowserContextOptions};
 use crate::server::channel::Channel;
@@ -56,6 +56,11 @@ use std::sync::Arc;
 /// // Connect to a remote browser (e.g., started with `npx playwright launch-server`)
 /// // let browser3 = chromium.connect("ws://localhost:3000", None).await?;
 /// // browser3.close().await?;
+///
+/// // === CDP Connection (Chromium only) ===
+/// // Connect to a Chrome instance with remote debugging enabled
+/// // let browser4 = chromium.connect_over_cdp("http://localhost:9222", None).await?;
+/// // browser4.close().await?;
 ///
 /// // === Persistent Context Launch ===
 /// // Launch with persistent storage (cookies, local storage, etc.)
@@ -480,6 +485,77 @@ impl BrowserType {
 
         Ok(browser.clone())
     }
+
+    /// Connects to a browser over the Chrome DevTools Protocol.
+    ///
+    /// This method is only supported for Chromium. It connects to an existing Chrome
+    /// instance that exposes a CDP endpoint (e.g., `--remote-debugging-port`), or to
+    /// CDP-compatible services like browserless.
+    ///
+    /// Unlike `connect()`, which uses Playwright's proprietary WebSocket protocol,
+    /// this method connects directly via CDP. The Playwright server manages the CDP
+    /// connection internally.
+    ///
+    /// # Arguments
+    /// * `endpoint_url` - A CDP endpoint URL (e.g., `http://localhost:9222` or
+    ///   `ws://localhost:9222/devtools/browser/...`)
+    /// * `options` - Optional connection options.
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Called on a non-Chromium browser type
+    /// - Connection to the CDP endpoint fails
+    /// - Connection timeout
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsertype#browser-type-connect-over-cdp>
+    pub async fn connect_over_cdp(
+        &self,
+        endpoint_url: &str,
+        options: Option<ConnectOverCdpOptions>,
+    ) -> Result<Browser> {
+        // connect_over_cdp is Chromium-only
+        if self.name() != "chromium" {
+            return Err(crate::error::Error::ProtocolError(
+                "Connecting over CDP is only supported in Chromium.".to_string(),
+            ));
+        }
+
+        let options = options.unwrap_or_default();
+
+        // Convert headers from HashMap to array of {name, value} objects
+        let headers_array = options.headers.map(|h| {
+            h.into_iter()
+                .map(|(name, value)| HeaderEntry { name, value })
+                .collect::<Vec<_>>()
+        });
+
+        let params = ConnectOverCdpParams {
+            endpoint_url: endpoint_url.to_string(),
+            headers: headers_array,
+            slow_mo: options.slow_mo,
+            timeout: options.timeout.unwrap_or(crate::DEFAULT_TIMEOUT_MS),
+        };
+
+        // Send connectOverCDP RPC to the local Playwright server
+        let response: ConnectOverCdpResponse =
+            self.base.channel().send("connectOverCDP", params).await?;
+
+        // Get browser object from registry
+        let browser_arc = self.connection().get_object(&response.browser.guid).await?;
+
+        // Downcast to Browser
+        let browser = browser_arc
+            .as_any()
+            .downcast_ref::<Browser>()
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(format!(
+                    "Expected Browser object, got {}",
+                    browser_arc.type_name()
+                ))
+            })?;
+
+        Ok(browser.clone())
+    }
 }
 
 /// Response from BrowserType.launch() protocol call
@@ -512,6 +588,34 @@ struct ContextRef {
         deserialize_with = "crate::server::connection::deserialize_arc_str"
     )]
     guid: Arc<str>,
+}
+
+/// Parameters for BrowserType.connectOverCDP() protocol call
+#[derive(Debug, Serialize)]
+struct ConnectOverCdpParams {
+    #[serde(rename = "endpointURL")]
+    endpoint_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<Vec<HeaderEntry>>,
+    #[serde(rename = "slowMo", skip_serializing_if = "Option::is_none")]
+    slow_mo: Option<f64>,
+    timeout: f64,
+}
+
+/// A single HTTP header as {name, value} for the connectOverCDP protocol
+#[derive(Debug, Serialize)]
+struct HeaderEntry {
+    name: String,
+    value: String,
+}
+
+/// Response from BrowserType.connectOverCDP() protocol call
+#[derive(Debug, Deserialize)]
+struct ConnectOverCdpResponse {
+    browser: BrowserRef,
+    #[serde(rename = "defaultContext")]
+    #[allow(dead_code)]
+    default_context: Option<ContextRef>,
 }
 
 impl ChannelOwner for BrowserType {

@@ -214,5 +214,5 @@ pub use protocol::{
 // Re-export routing types
 pub use protocol::{FulfillOptions, Route};
 
-// Re-export launch options
-pub use api::LaunchOptions;
+// Re-export launch and connection options
+pub use api::{ConnectOverCdpOptions, LaunchOptions};

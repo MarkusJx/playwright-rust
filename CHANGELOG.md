@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_by_test_id(test_id)` - Find elements by `data-testid` attribute (always exact)
   - All methods available on both `Page` and `Locator` (chainable)
   - Case-insensitive substring matching by default (`exact=false`), case-sensitive exact with `exact=true`
+- **`connect_over_cdp`** - Connect to Chrome DevTools Protocol endpoints (Issue #32)
+  - `browser_type.connect_over_cdp(endpoint_url, options)` - Connect to remote Chrome via CDP
+  - Supports browserless, Chrome with `--remote-debugging-port`, and other CDP services
+  - Accepts optional headers, timeout, and slow_mo options
+  - Chromium-only (returns error for Firefox/WebKit)
 - **BrowserContext proxy support** - Added `proxy` option to `BrowserContextOptions` for per-context proxy configuration (PR #29, Issue #28)
   - Enables rotating proxies without creating new browser instances
   - Supports HTTP and SOCKS proxies with optional authentication
