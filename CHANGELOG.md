@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Works with iframes and sub-resources
 - **Response accessor methods** - `response.status()`, `response.status_text()`, `response.url()` (PR #37)
 
+### Fixed
+
+- Replace `unwrap()` with graceful error handling in network event dispatch (Issue #40)
+
 ## [0.8.4] - 2026-03-01
 
 ### Added

@@ -483,7 +483,10 @@ impl BrowserContext {
                         Ok(v) => v,
                         Err(_) => return,
                     };
-                    let page = page_arc.as_any().downcast_ref::<Page>().unwrap();
+                    let page = match page_arc.as_any().downcast_ref::<Page>() {
+                        Some(p) => p,
+                        None => return,
+                    };
                     match method.as_str() {
                         "request" => page.trigger_request_event(request).await,
                         "requestFailed" => page.trigger_request_failed_event(request).await,
@@ -524,7 +527,10 @@ impl BrowserContext {
                         Ok(v) => v,
                         Err(_) => return,
                     };
-                    let page = page_arc.as_any().downcast_ref::<Page>().unwrap();
+                    let page = match page_arc.as_any().downcast_ref::<Page>() {
+                        Some(p) => p,
+                        None => return,
+                    };
                     page.trigger_response_event(response).await;
                 }
             });
