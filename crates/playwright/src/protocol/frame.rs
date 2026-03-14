@@ -674,6 +674,50 @@ impl Frame {
         Ok(response.value)
     }
 
+    /// Returns whether the element is hidden.
+    pub(crate) async fn locator_is_hidden(&self, selector: &str) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct IsHiddenResponse {
+            value: bool,
+        }
+
+        let response: IsHiddenResponse = self
+            .channel()
+            .send(
+                "isHidden",
+                serde_json::json!({
+                    "selector": selector,
+                    "strict": true,
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await?;
+
+        Ok(response.value)
+    }
+
+    /// Returns whether the element is disabled.
+    pub(crate) async fn locator_is_disabled(&self, selector: &str) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct IsDisabledResponse {
+            value: bool,
+        }
+
+        let response: IsDisabledResponse = self
+            .channel()
+            .send(
+                "isDisabled",
+                serde_json::json!({
+                    "selector": selector,
+                    "strict": true,
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await?;
+
+        Ok(response.value)
+    }
+
     /// Returns whether the element is focused (currently has focus).
     ///
     /// This implementation checks if the element is the activeElement in the DOM

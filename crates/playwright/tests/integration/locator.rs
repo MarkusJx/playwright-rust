@@ -168,6 +168,53 @@ async fn test_locator_state_methods() {
         .expect("Failed to check visibility");
     assert!(!hidden_visible);
 
+    // Test 3: is_hidden for hidden element
+    let is_hidden = hidden.is_hidden().await.expect("Failed to check is_hidden");
+    assert!(is_hidden, "Hidden element should report is_hidden=true");
+
+    // Test 4: is_hidden for visible element
+    let heading_hidden = heading
+        .is_hidden()
+        .await
+        .expect("Failed to check is_hidden");
+    assert!(
+        !heading_hidden,
+        "Visible element should report is_hidden=false"
+    );
+    tracing::info!("✓ is_hidden() works");
+
+    // Test 5: is_disabled for disabled button
+    let disabled_btn = page.locator("button[disabled]").await;
+    let is_disabled = disabled_btn
+        .is_disabled()
+        .await
+        .expect("Failed to check is_disabled");
+    assert!(
+        is_disabled,
+        "Disabled button should report is_disabled=true"
+    );
+
+    // Test 6: is_disabled for enabled element (h1 is not disabled)
+    let heading_disabled = heading
+        .is_disabled()
+        .await
+        .expect("Failed to check is_disabled");
+    assert!(
+        !heading_disabled,
+        "Enabled element should report is_disabled=false"
+    );
+
+    // Test 7: is_enabled for disabled button should be false
+    let disabled_enabled = disabled_btn
+        .is_enabled()
+        .await
+        .expect("Failed to check is_enabled");
+    assert!(
+        !disabled_enabled,
+        "Disabled button should report is_enabled=false"
+    );
+    tracing::info!("✓ is_disabled() works");
+
     browser.close().await.expect("Failed to close browser");
     server.shutdown();
 }

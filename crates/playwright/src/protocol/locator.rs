@@ -667,6 +667,26 @@ impl Locator {
             .map_err(|e| self.wrap_error_with_selector(e))
     }
 
+    /// Returns whether the element is hidden.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-is-hidden>
+    pub async fn is_hidden(&self) -> Result<bool> {
+        self.frame
+            .locator_is_hidden(&self.selector)
+            .await
+            .map_err(|e| self.wrap_error_with_selector(e))
+    }
+
+    /// Returns whether the element is disabled.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-is-disabled>
+    pub async fn is_disabled(&self) -> Result<bool> {
+        self.frame
+            .locator_is_disabled(&self.selector)
+            .await
+            .map_err(|e| self.wrap_error_with_selector(e))
+    }
+
     /// Returns whether the element is focused (currently has focus).
     ///
     /// See: <https://playwright.dev/docs/api/class-locator#locator-is-focused>

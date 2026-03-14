@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`page.set_content(html)`** - Set page HTML content directly, with optional timeout and wait_until options
 - **`page.wait_for_load_state(state)`** - Wait for `load`, `domcontentloaded`, or `networkidle` states
 - **`page.wait_for_url(url)`** - Wait for navigation to a matching URL (exact string or glob pattern)
+- **`locator.is_hidden()` / `locator.is_disabled()`** - Negative state checks complementing `is_visible()` and `is_enabled()`
 
 ### Fixed
 
