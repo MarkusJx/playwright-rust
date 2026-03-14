@@ -17,6 +17,17 @@ const DRIVER_BASE_URL: &str = "https://playwright.azureedge.net/builds/driver";
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // Skip driver download on docs.rs — it has no network access and doesn't need drivers
+    if std::env::var("DOCS_RS").is_ok() {
+        println!("cargo:rustc-env=PLAYWRIGHT_DRIVER_DIR=");
+        println!(
+            "cargo:rustc-env=PLAYWRIGHT_DRIVER_VERSION={}",
+            PLAYWRIGHT_VERSION
+        );
+        println!("cargo:rustc-env=PLAYWRIGHT_DRIVER_PLATFORM=docs-rs");
+        return;
+    }
+
     // Get the appropriate drivers directory using robust workspace detection
     let drivers_dir = get_drivers_dir();
 

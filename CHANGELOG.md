@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-03-14
+
+### Fixed
+
+- **docs.rs build** — Skip Playwright driver download when building on docs.rs (no network access needed for documentation)
+- **Imprecise dependency versions** — Pin workspace dependencies to minor versions (e.g., `serde = "1.0"` instead of `"1"`)
+
 ## [0.8.5] - 2026-03-14
 
 ### Added
@@ -359,7 +366,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Playwright returns null for data URLs and `about:blank` (valid behavior, not an error)
   - Migration: `page.goto("https://example.com").await?.expect("response")` or use `if let Some(response) = page.goto(...).await? { ... }`
 
-[Unreleased]: https://github.com/padamson/playwright-rust/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/padamson/playwright-rust/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/padamson/playwright-rust/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/padamson/playwright-rust/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/padamson/playwright-rust/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/padamson/playwright-rust/compare/v0.8.2...v0.8.3

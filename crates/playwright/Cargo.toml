@@ -48,6 +48,10 @@ reqwest = { version = "0.13", features = ["blocking"] }
 zip = "8.1"
 dirs = "6.0"
 
+[package.metadata.docs.rs]
+# docs.rs doesn't need Playwright drivers — build.rs skips download when DOCS_RS is set
+rustc-args = ["--cfg", "docsrs"]
+
 [[bench]]
 name = "browser_operations"
 harness = false

@@ -796,7 +796,7 @@ pub struct LocalStorageItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Origin {
-    /// Origin URL (e.g., "https://example.com")
+    /// Origin URL (e.g., `https://example.com`)
     pub origin: String,
     /// Local storage items for this origin
     pub local_storage: Vec<LocalStorageItem>,
