@@ -1200,6 +1200,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_escape_for_selector_case_insensitive() {
+        assert_eq!(escape_for_selector("hello", false), "\"hello\"i");
+    }
+
+    #[test]
+    fn test_escape_for_selector_exact() {
+        assert_eq!(escape_for_selector("hello", true), "\"hello\"s");
+    }
+
+    #[test]
+    fn test_escape_for_selector_with_quotes() {
+        assert_eq!(
+            escape_for_selector("say \"hi\"", false),
+            "\"say \\\"hi\\\"\"i"
+        );
+    }
+
+    #[test]
+    fn test_get_by_text_selector_case_insensitive() {
+        assert_eq!(
+            get_by_text_selector("Click me", false),
+            "internal:text=\"Click me\"i"
+        );
+    }
+
+    #[test]
+    fn test_get_by_text_selector_exact() {
+        assert_eq!(
+            get_by_text_selector("Click me", true),
+            "internal:text=\"Click me\"s"
+        );
+    }
+
+    #[test]
+    fn test_get_by_label_selector() {
+        assert_eq!(
+            get_by_label_selector("Email", false),
+            "internal:label=\"Email\"i"
+        );
+    }
+
+    #[test]
+    fn test_get_by_placeholder_selector() {
+        assert_eq!(
+            get_by_placeholder_selector("Enter name", false),
+            "internal:attr=[placeholder=\"Enter name\"i]"
+        );
+    }
+
+    #[test]
+    fn test_get_by_alt_text_selector() {
+        assert_eq!(
+            get_by_alt_text_selector("Logo", true),
+            "internal:attr=[alt=\"Logo\"s]"
+        );
+    }
+
+    #[test]
+    fn test_get_by_title_selector() {
+        assert_eq!(
+            get_by_title_selector("Help", false),
+            "internal:attr=[title=\"Help\"i]"
+        );
+    }
+
+    #[test]
+    fn test_get_by_test_id_selector() {
+        assert_eq!(
+            get_by_test_id_selector("submit-btn"),
+            "internal:testid=[data-testid=\"submit-btn\"s]"
+        );
+    }
+
+    #[test]
     fn test_escape_for_attribute_selector_case_insensitive() {
         assert_eq!(
             escape_for_attribute_selector("Submit", false),
