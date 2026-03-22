@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `focus()` / `blur()` — set or remove keyboard focus on an element
   - `press_sequentially(text, options)` — type characters one by one with optional delay
   - `all_inner_texts()` / `all_text_contents()` — bulk text retrieval from all matching elements
+  - `dispatch_event(type, event_init)` — fire DOM events with optional initialization data
+  - `bounding_box()` — get element dimensions and position (x, y, width, height)
+  - `scroll_into_view_if_needed()` — scroll element into viewport
 - **BrowserContext runtime setters** — configure context after creation
   - `cookies(urls)` — retrieve cookies, optionally filtered by URL
   - `clear_cookies(options)` — remove cookies with optional name/domain/path filters

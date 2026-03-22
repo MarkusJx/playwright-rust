@@ -1299,3 +1299,245 @@ async fn test_locator_all_texts_empty_when_no_match() {
     browser.close().await.expect("Failed to close browser");
     server.shutdown();
 }
+
+// ============================================================================
+// dispatch_event, bounding_box, scroll_into_view_if_needed
+// ============================================================================
+
+/// Test that dispatch_event fires a click event on a button and the handler runs.
+#[tokio::test]
+async fn test_locator_dispatch_event() {
+    crate::common::init_tracing();
+    let playwright = Playwright::launch()
+        .await
+        .expect("Failed to launch Playwright");
+    let browser = playwright
+        .chromium()
+        .launch()
+        .await
+        .expect("Failed to launch browser");
+    let page = browser.new_page().await.expect("Failed to create page");
+
+    // Navigate to a page with a button whose text changes on click
+    page.goto(
+        "data:text/html,<button id='btn' onclick=\"this.textContent='fired'\">original</button>",
+        None,
+    )
+    .await
+    .expect("Failed to navigate");
+
+    let btn = page.locator("#btn").await;
+
+    // Dispatch a click event — handler should fire
+    btn.dispatch_event("click", None)
+        .await
+        .expect("dispatch_event should succeed");
+
+    let text = btn
+        .text_content()
+        .await
+        .expect("Failed to get text content");
+    assert_eq!(
+        text,
+        Some("fired".to_string()),
+        "click handler should have changed button text to 'fired'"
+    );
+
+    browser.close().await.expect("Failed to close browser");
+}
+
+/// Test that dispatch_event with eventInit data passes properties to the event handler.
+///
+/// Note: Playwright's dispatchEvent creates events using `new Event(type, eventInit)` for
+/// custom event types. Properties like `clientX` (for mouse events) are accessible via the
+/// appropriate event subtype. For simpler verification, we test that eventInit properties
+/// like `bubbles` affect event propagation.
+#[tokio::test]
+async fn test_locator_dispatch_event_with_init() {
+    crate::common::init_tracing();
+    let playwright = Playwright::launch()
+        .await
+        .expect("Failed to launch Playwright");
+    let browser = playwright
+        .chromium()
+        .launch()
+        .await
+        .expect("Failed to launch browser");
+    let page = browser.new_page().await.expect("Failed to create page");
+
+    // Page listens for a mousemove event and records the clientX from eventInit
+    page.goto(
+        "data:text/html,<div id='target' style='width:100px;height:100px'>waiting</div>\
+         <script>\
+           document.getElementById('target').addEventListener('mousemove', function(e) {\
+             this.textContent = String(e.clientX);\
+           });\
+         </script>",
+        None,
+    )
+    .await
+    .expect("Failed to navigate");
+
+    let target = page.locator("#target").await;
+
+    // Dispatch a mousemove event with clientX in eventInit
+    let event_init = serde_json::json!({ "clientX": 42 });
+    target
+        .dispatch_event("mousemove", Some(event_init))
+        .await
+        .expect("dispatch_event with init should succeed");
+
+    let text = target
+        .text_content()
+        .await
+        .expect("Failed to get text content");
+    assert_eq!(
+        text,
+        Some("42".to_string()),
+        "mousemove event clientX from eventInit should be 42"
+    );
+
+    browser.close().await.expect("Failed to close browser");
+}
+
+/// Test that bounding_box returns reasonable dimensions for a visible element.
+#[tokio::test]
+async fn test_locator_bounding_box() {
+    crate::common::init_tracing();
+    let playwright = Playwright::launch()
+        .await
+        .expect("Failed to launch Playwright");
+    let browser = playwright
+        .chromium()
+        .launch()
+        .await
+        .expect("Failed to launch browser");
+    let page = browser.new_page().await.expect("Failed to create page");
+
+    // A styled, visible div with known dimensions
+    page.goto(
+        "data:text/html,<div id='box' style='width:100px;height:50px;background:blue;position:absolute;top:10px;left:20px'></div>",
+        None,
+    )
+    .await
+    .expect("Failed to navigate");
+
+    let locator = page.locator("#box").await;
+    let bbox = locator
+        .bounding_box()
+        .await
+        .expect("bounding_box should succeed");
+
+    assert!(bbox.is_some(), "Visible element should have a bounding box");
+    let bbox = bbox.unwrap();
+
+    // Dimensions should be positive and reasonable
+    assert!(bbox.width > 0.0, "width should be positive");
+    assert!(bbox.height > 0.0, "height should be positive");
+    assert!(bbox.x >= 0.0, "x should be non-negative");
+    assert!(bbox.y >= 0.0, "y should be non-negative");
+
+    // The styled element should be approximately 100x50
+    assert!(
+        (bbox.width - 100.0).abs() < 2.0,
+        "width should be approximately 100px, got {}",
+        bbox.width
+    );
+    assert!(
+        (bbox.height - 50.0).abs() < 2.0,
+        "height should be approximately 50px, got {}",
+        bbox.height
+    );
+
+    browser.close().await.expect("Failed to close browser");
+}
+
+/// Test that bounding_box returns None for a hidden (display:none) element.
+#[tokio::test]
+async fn test_locator_bounding_box_hidden() {
+    crate::common::init_tracing();
+    let playwright = Playwright::launch()
+        .await
+        .expect("Failed to launch Playwright");
+    let browser = playwright
+        .chromium()
+        .launch()
+        .await
+        .expect("Failed to launch browser");
+    let page = browser.new_page().await.expect("Failed to create page");
+
+    page.goto(
+        "data:text/html,<div id='hidden' style='display:none'>hidden</div>",
+        None,
+    )
+    .await
+    .expect("Failed to navigate");
+
+    let locator = page.locator("#hidden").await;
+    let bbox = locator
+        .bounding_box()
+        .await
+        .expect("bounding_box should not error for hidden element");
+
+    assert!(
+        bbox.is_none(),
+        "Hidden element (display:none) should return None for bounding_box"
+    );
+
+    browser.close().await.expect("Failed to close browser");
+}
+
+/// Test that scroll_into_view_if_needed scrolls an off-screen element into view.
+#[tokio::test]
+async fn test_locator_scroll_into_view_if_needed() {
+    crate::common::init_tracing();
+    let playwright = Playwright::launch()
+        .await
+        .expect("Failed to launch Playwright");
+    let browser = playwright
+        .chromium()
+        .launch()
+        .await
+        .expect("Failed to launch browser");
+    let page = browser.new_page().await.expect("Failed to create page");
+
+    // Create a page taller than the viewport with a target element far below
+    page.goto(
+        "data:text/html,<div style='height:2000px'>tall spacer</div>\
+         <div id='target' style='height:50px;background:green'>scroll target</div>",
+        None,
+    )
+    .await
+    .expect("Failed to navigate");
+
+    let target = page.locator("#target").await;
+
+    // The element should be below the viewport initially
+    // After scroll_into_view_if_needed, it should be visible
+    target
+        .scroll_into_view_if_needed()
+        .await
+        .expect("scroll_into_view_if_needed should succeed");
+
+    // Verify the element is now in the viewport by checking its bounding box
+    let bbox = target
+        .bounding_box()
+        .await
+        .expect("bounding_box after scroll should succeed")
+        .expect("element should be visible after scrolling into view");
+
+    // The element should now be within the viewport (y >= 0 and within viewport height)
+    // Default viewport is 1280x720
+    assert!(
+        bbox.y >= 0.0,
+        "After scroll, element y should be >= 0, got {}",
+        bbox.y
+    );
+    assert!(
+        bbox.y < 720.0,
+        "After scroll, element y should be within viewport height (720px), got {}",
+        bbox.y
+    );
+
+    browser.close().await.expect("Failed to close browser");
+}

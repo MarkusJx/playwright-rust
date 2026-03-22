@@ -1603,6 +1603,74 @@ impl Frame {
         Ok(handle)
     }
 
+    /// Dispatches a DOM event on the element matching the selector.
+    ///
+    /// Unlike clicking or typing, `dispatch_event` directly sends the event without
+    /// performing any actionability checks. It still waits for the element to be present
+    /// in the DOM.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-dispatch-event>
+    pub(crate) async fn locator_dispatch_event(
+        &self,
+        selector: &str,
+        type_: &str,
+        event_init: Option<serde_json::Value>,
+    ) -> Result<()> {
+        // Serialize eventInit using Playwright's protocol argument format.
+        // If None, use {"value": {"v": "undefined"}, "handles": []}.
+        let event_init_serialized = match event_init {
+            Some(v) => serialize_argument(&v),
+            None => serde_json::json!({"value": {"v": "undefined"}, "handles": []}),
+        };
+
+        let params = serde_json::json!({
+            "selector": selector,
+            "type": type_,
+            "eventInit": event_init_serialized,
+            "strict": true,
+            "timeout": crate::DEFAULT_TIMEOUT_MS
+        });
+
+        self.channel().send_no_result("dispatchEvent", params).await
+    }
+
+    /// Returns the bounding box of the element matching the selector, or None if not visible.
+    ///
+    /// The bounding box is returned in pixels. If the element is not visible (e.g.,
+    /// `display: none`), returns `None`.
+    ///
+    /// Implemented via ElementHandle because `boundingBox` is an ElementHandle-level
+    /// protocol method, not a Frame-level method.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-bounding-box>
+    pub(crate) async fn locator_bounding_box(
+        &self,
+        selector: &str,
+    ) -> Result<Option<crate::protocol::locator::BoundingBox>> {
+        let element = self.query_selector(selector).await?;
+        match element {
+            Some(handle) => handle.bounding_box().await,
+            None => Ok(None),
+        }
+    }
+
+    /// Scrolls the element into view if it is not already visible in the viewport.
+    ///
+    /// Implemented via ElementHandle because `scrollIntoViewIfNeeded` is an
+    /// ElementHandle-level protocol method, not a Frame-level method.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-scroll-into-view-if-needed>
+    pub(crate) async fn locator_scroll_into_view_if_needed(&self, selector: &str) -> Result<()> {
+        let element = self.query_selector(selector).await?;
+        match element {
+            Some(handle) => handle.scroll_into_view_if_needed().await,
+            None => Err(crate::error::Error::ElementNotFound(format!(
+                "Element not found: {}",
+                selector
+            ))),
+        }
+    }
+
     /// Adds a `<script>` tag into the frame with the desired content.
     ///
     /// # Arguments

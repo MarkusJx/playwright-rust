@@ -65,7 +65,7 @@ pub use file_payload::{FilePayload, FilePayloadBuilder};
 pub use frame::Frame;
 pub use keyboard::Keyboard;
 pub use local_utils::LocalUtils;
-pub use locator::{AriaRole, FilterOptions, GetByRoleOptions, Locator};
+pub use locator::{AriaRole, BoundingBox, FilterOptions, GetByRoleOptions, Locator};
 pub use mouse::Mouse;
 pub use page::{
     AddScriptTagOptions, AddScriptTagOptionsBuilder, AddStyleTagOptions, ColorScheme,

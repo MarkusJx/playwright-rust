@@ -17,7 +17,25 @@
 
 use crate::error::Result;
 use crate::protocol::Frame;
+use serde::Deserialize;
 use std::sync::Arc;
+
+/// The bounding box of an element in pixels.
+///
+/// All values are measured relative to the top-left corner of the page.
+///
+/// See: <https://playwright.dev/docs/api/class-locator#locator-bounding-box>
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct BoundingBox {
+    /// The x coordinate of the top-left corner of the element in pixels.
+    pub x: f64,
+    /// The y coordinate of the top-left corner of the element in pixels.
+    pub y: f64,
+    /// The width of the element in pixels.
+    pub width: f64,
+    /// The height of the element in pixels.
+    pub height: f64,
+}
 
 /// Escapes text for use in Playwright's internal selector engine.
 ///
@@ -1152,6 +1170,74 @@ impl Locator {
     ) -> Result<()> {
         self.frame
             .locator_set_input_files_payload_multiple(&self.selector, files)
+            .await
+            .map_err(|e| self.wrap_error_with_selector(e))
+    }
+
+    /// Dispatches a DOM event on the element.
+    ///
+    /// Unlike clicking or typing, `dispatch_event` directly sends the event without
+    /// performing any actionability checks. It still waits for the element to be present
+    /// in the DOM.
+    ///
+    /// # Arguments
+    ///
+    /// * `type_` - The event type to dispatch, e.g. `"click"`, `"focus"`, `"myevent"`.
+    /// * `event_init` - Optional event initializer properties (e.g. `{"detail": "value"}` for
+    ///   `CustomEvent`). Corresponds to the second argument of `new Event(type, init)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The element is not found within the timeout
+    /// - The protocol call fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-dispatch-event>
+    pub async fn dispatch_event(
+        &self,
+        type_: &str,
+        event_init: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.frame
+            .locator_dispatch_event(&self.selector, type_, event_init)
+            .await
+            .map_err(|e| self.wrap_error_with_selector(e))
+    }
+
+    /// Returns the bounding box of the element, or `None` if the element is not visible.
+    ///
+    /// The bounding box is in pixels, relative to the top-left corner of the page.
+    /// Returns `None` when the element has `display: none` or is otherwise not part of
+    /// the layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The element is not found within the timeout
+    /// - The protocol call fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-bounding-box>
+    pub async fn bounding_box(&self) -> Result<Option<BoundingBox>> {
+        self.frame
+            .locator_bounding_box(&self.selector)
+            .await
+            .map_err(|e| self.wrap_error_with_selector(e))
+    }
+
+    /// Scrolls the element into view if it is not already visible in the viewport.
+    ///
+    /// This is an alias for calling `element.scrollIntoView()` in the browser.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The element is not found within the timeout
+    /// - The protocol call fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-scroll-into-view-if-needed>
+    pub async fn scroll_into_view_if_needed(&self) -> Result<()> {
+        self.frame
+            .locator_scroll_into_view_if_needed(&self.selector)
             .await
             .map_err(|e| self.wrap_error_with_selector(e))
     }
