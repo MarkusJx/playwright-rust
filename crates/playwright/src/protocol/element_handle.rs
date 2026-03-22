@@ -4,6 +4,7 @@
 // ElementHandles are created via query_selector methods and are protocol objects with GUIDs.
 
 use crate::error::Result;
+use crate::protocol::locator::BoundingBox;
 use crate::server::channel_owner::{ChannelOwner, ChannelOwnerImpl, ParentOrConnection};
 use base64::Engine;
 use serde::Deserialize;
@@ -97,6 +98,46 @@ impl ElementHandle {
             })?;
 
         Ok(bytes)
+    }
+
+    /// Returns the bounding box of this element, or None if it is not visible.
+    ///
+    /// The bounding box is in pixels, relative to the top-left corner of the page.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-elementhandle#element-handle-bounding-box>
+    pub async fn bounding_box(&self) -> Result<Option<BoundingBox>> {
+        #[derive(Deserialize)]
+        struct BoundingBoxResponse {
+            value: Option<BoundingBox>,
+        }
+
+        let response: BoundingBoxResponse = self
+            .base
+            .channel()
+            .send(
+                "boundingBox",
+                serde_json::json!({
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await?;
+
+        Ok(response.value)
+    }
+
+    /// Scrolls this element into the viewport if it is not already visible.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-elementhandle#element-handle-scroll-into-view-if-needed>
+    pub async fn scroll_into_view_if_needed(&self) -> Result<()> {
+        self.base
+            .channel()
+            .send_no_result(
+                "scrollIntoViewIfNeeded",
+                serde_json::json!({
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await
     }
 }
 

@@ -7,6 +7,248 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **TLS backend features** — Expose `native-tls`, `rustls-tls-native-roots`, and `rustls-tls-webpki-roots` features for choosing TLS implementation (PR #41). Defaults to `native-tls`.
+- **Locator filtering & composition** — `filter()`, `and_()`, `or_()` methods for narrowing and combining locators
+  - `filter(FilterOptions)` — narrow by `has_text`, `has_not_text`, `has` (child locator), `has_not`
+  - `and_(locator)` — match elements satisfying both locators
+  - `or_(locator)` — match elements satisfying either locator
+- **Locator interaction methods** — `focus()`, `blur()`, `press_sequentially()`, `all_inner_texts()`, `all_text_contents()`
+  - `focus()` / `blur()` — set or remove keyboard focus on an element
+  - `press_sequentially(text, options)` — type characters one by one with optional delay
+  - `all_inner_texts()` / `all_text_contents()` — bulk text retrieval from all matching elements
+  - `dispatch_event(type, event_init)` — fire DOM events with optional initialization data
+  - `bounding_box()` — get element dimensions and position (x, y, width, height)
+  - `scroll_into_view_if_needed()` — scroll element into viewport
+- **BrowserContext runtime setters** — configure context after creation
+  - `cookies(urls)` — retrieve cookies, optionally filtered by URL
+  - `clear_cookies(options)` — remove cookies with optional name/domain/path filters
+  - `set_extra_http_headers(headers)` — add HTTP headers to all requests
+  - `grant_permissions(permissions, options)` — grant browser permissions (geolocation, camera, etc.)
+  - `clear_permissions()` — revoke all granted permissions
+  - `set_geolocation(geolocation)` — override device geolocation, or pass None to clear
+  - `set_offline(offline)` — toggle offline mode
+- **Page methods** — `bring_to_front()`, `viewport_size()`, `set_extra_http_headers()`, `emulate_media()`, `pdf()`, `add_script_tag()`
+  - `bring_to_front()` — activate the page tab
+  - `viewport_size()` — get current viewport dimensions (returns None if no_viewport context)
+  - `set_extra_http_headers(headers)` — add HTTP headers to all page requests
+  - `emulate_media(options)` — override CSS media type, color scheme, reduced motion, forced colors
+  - `pdf(options)` — generate PDF (Chromium only), with full options (margins, scale, landscape, etc.)
+  - `add_script_tag(options)` — inject JavaScript via URL, file path, or inline content
+
+### Fixed
+
+- **docs.rs build** — Pin docs.rs to `nightly-2025-05-01` to work around `generic-array` 0.14 incompatibility with Rust 1.92+ (`doc_auto_cfg` removal)
+
+## [0.8.6] - 2026-03-14
+
+### Fixed
+
+- **docs.rs build** — Skip Playwright driver download when building on docs.rs (no network access needed for documentation)
+- **Imprecise dependency versions** — Pin workspace dependencies to minor versions (e.g., `serde = "1.0"` instead of `"1"`)
+
+## [0.8.5] - 2026-03-14
+
+### Added
+
+- **`ignore_default_args` for persistent contexts** - Added `ignore_default_args` option to `BrowserContextOptions` for use with `launch_persistent_context_with_options()` (Issue #38)
+  - `IgnoreDefaultArgs::Bool(true)` - Playwright does not pass its own default args
+  - `IgnoreDefaultArgs::Array(vec)` - Filters out specific default arguments
+  - Applies same `ignoreDefaultArgs` → `ignoreAllDefaultArgs` protocol normalization as `LaunchOptions`
+  - Matches Playwright's official `launchPersistentContext` API
+- **Page network event listeners** - Subscribe to network events on individual pages (PR #37)
+  - `page.on_request(handler)` - Fires when a request is issued
+  - `page.on_response(handler)` - Fires when a response is received
+  - `page.on_request_finished(handler)` - Fires when a request completes successfully
+  - `page.on_request_failed(handler)` - Fires when a request fails
+  - Lazy subscription: events are only subscribed when a handler is registered
+  - Works with iframes and sub-resources
+- **Response accessor methods** - `response.status()`, `response.status_text()`, `response.url()` (PR #37)
+- **`page.go_back()` / `page.go_forward()`** - History navigation with optional timeout and wait_until options
+- **`page.set_content(html)`** - Set page HTML content directly, with optional timeout and wait_until options
+- **`page.wait_for_load_state(state)`** - Wait for `load`, `domcontentloaded`, or `networkidle` states
+- **`page.wait_for_url(url)`** - Wait for navigation to a matching URL (exact string or glob pattern)
+- **`locator.is_hidden()` / `locator.is_disabled()`** - Negative state checks complementing `is_visible()` and `is_enabled()`
+- **`to_have_screenshot()` visual regression assertion** (Issue #35)
+  - `expect(locator).to_have_screenshot(path, options)` — compare locator screenshot against baseline
+  - `expect_page(&page).to_have_screenshot(path, options)` — page-level screenshot comparison
+  - Auto-creates baseline on first run, compares on subsequent runs
+  - `max_diff_pixels` / `max_diff_pixel_ratio` — configurable tolerance
+  - `threshold` — per-pixel color distance tolerance (default 0.2)
+  - `animations: Disabled` — freeze CSS animations/transitions before capture
+  - `mask` — overlay locators with pink (#FF00FF) to exclude dynamic content
+  - `update_snapshots` — force baseline update
+  - Generates diff image on failure highlighting differences in red
+  - Auto-retry with timeout (default 5s), matching Playwright's assertion pattern
+
+### Fixed
+
+- Replace `unwrap()` with graceful error handling in network event dispatch (Issue #40)
+
+## [0.8.4] - 2026-03-01
+
+### Added
+
+- **`get_by_*` locators** - Modern Playwright locator methods for finding elements by user-facing attributes
+  - `get_by_text(text, exact)` - Find by text content
+  - `get_by_label(text, exact)` - Find form controls by associated label
+  - `get_by_placeholder(text, exact)` - Find inputs by placeholder text
+  - `get_by_alt_text(text, exact)` - Find images by alt text
+  - `get_by_title(text, exact)` - Find elements by title attribute
+  - `get_by_test_id(test_id)` - Find elements by `data-testid` attribute (always exact)
+  - `get_by_role(role, options)` - Find elements by ARIA role with optional name, checked, disabled, expanded, selected, level, pressed, include_hidden filters
+  - All methods available on both `Page` and `Locator` (chainable)
+  - Case-insensitive substring matching by default (`exact=false`), case-sensitive exact with `exact=true`
+  - `AriaRole` enum with 81 ARIA roles for compile-time safety
+  - `GetByRoleOptions` struct for role-based filtering
+- **`connect_over_cdp`** - Connect to Chrome DevTools Protocol endpoints (Issue #32)
+  - `browser_type.connect_over_cdp(endpoint_url, options)` - Connect to remote Chrome via CDP
+  - Supports browserless, Chrome with `--remote-debugging-port`, and other CDP services
+  - Accepts optional headers, timeout, and slow_mo options
+  - Chromium-only (returns error for Firefox/WebKit)
+- **`Locator.all()`** - Iterate over all matching elements (Issue #33)
+  - `locator.all()` returns `Vec<Locator>`, one per matching element
+  - Empty vec for non-matching selectors (no error)
+  - Matches Playwright's `locator.all()` API
+- **Improved error messages** - All locator methods now include the selector in error messages (Issue #33)
+  - Timeout errors show `[selector: div.page-number > span:last-child]` instead of generic messages
+  - Applied to all query methods (`text_content`, `get_attribute`, etc.) and action methods (`click`, `fill`, etc.)
+- **BrowserContext proxy support** - Added `proxy` option to `BrowserContextOptions` for per-context proxy configuration (PR #29, Issue #28)
+  - Enables rotating proxies without creating new browser instances
+  - Supports HTTP and SOCKS proxies with optional authentication
+- **Complete Route API** - Full network interception parity with Playwright (Issue #36)
+  - `route.fallback(overrides)` - Continue to next matching handler (handler chaining)
+  - `route.fetch(options)` - Fetch actual response for inspection/modification before fulfilling
+  - `FetchResponse` type with `status()`, `ok()`, `headers()`, `body()`, `text()`, `json()` methods
+  - `FetchOptions` builder for customizing fetch requests (method, headers, post_data, timeout)
+- **Context-level routing** - `BrowserContext.route()`, `unroute()`, `unroute_all()` for routing across all pages in a context
+- **Page unroute methods** - `page.unroute(pattern)` and `page.unroute_all()` for removing route handlers
+- **APIRequestContext** - Internal implementation for `route.fetch()` via BrowserContext's request context
+  - Handles fetch → fetchResponseBody → disposeAPIResponse protocol flow
+  - Automatic base64 encoding/decoding for request and response bodies
+- **`UnrouteBehavior` enum** - Control behavior when removing route handlers
+
+### Fixed
+
+- **`no_viewport(true)` / `--start-maximized` not working** - Fixed protocol field name for viewport disabling (Issue #34)
+  - `no_viewport` now correctly serializes as `noDefaultViewport` (matching the Playwright protocol)
+  - Previously serialized as `noViewport` which the server silently ignored
+  - Enables `--start-maximized` with `no_viewport(true)` to produce maximized browser windows
+
+## [0.8.3] - 2026-01-25
+
+### Added
+
+- **PLAYWRIGHT_VERSION constant** - Exposes bundled Playwright driver version (`1.56.1`) as a public constant for version-aware browser installation (Issue #27)
+- **Helpful browser installation errors** - Detects missing browser errors and provides actionable guidance (Issue #27)
+- **Page.content()** - Returns full HTML content of the page including DOCTYPE (Issue #23)
+  - `page.content()` - Retrieves complete HTML markup
+  - `frame.content()` - Frame-level implementation for consistency with Playwright API
+- **Page.set_viewport_size()** - Dynamically resize viewport for responsive testing (Issue #24)
+  - `page.set_viewport_size(viewport)` - Set viewport to specific width/height
+  - Enables testing mobile, tablet, and desktop layouts within a single page session
+
+### Fixed
+
+- **page.url() hash navigation** - URL now correctly includes hash fragment after anchor clicks (Issue #26)
+  - Frame now handles "navigated" events to track URL changes including hash updates
+  - Page delegates to main frame for URL (matches playwright-python/JS behavior)
+
+### Changed
+
+- **Rust Edition 2024** - Upgraded to Rust Edition 2024, requiring Rust 1.85+
+- **README documentation** - Added comprehensive browser installation section (Issue #25)
+
+## [0.8.2] - 2026-01-19
+
+### Added
+
+- **Protocol Stubs** - Explicit protocol types for `Android`, `Electron`, `Tracing`, `APIRequestContext`, and `LocalUtils` to support valid registration and prevent "Unknown protocol type" warnings. (Implemented as stubs for future expansion)
+- **Cookie & Storage Management** - Implemented `BrowserContext::storage_state()` and `BrowserContext::add_cookies()` (Issue #10)
+- **Remote Connection** - Support for connecting to remote browsers via WebSocket
+  - `BrowserType::connect(url, options)` implementation
+  - `ConnectOptions` builder for connection configuration (headers, slow_mo, timeout)
+  - WebSocket transport using `tokio-tungstenite`
+  - Internal transport abstraction supporting both options (Pipe and WebSocket)
+- **WebSocket Event Handling** - `Page::on_websocket()` for intercepting WebSocket connections (Slice 2)
+  - `WebSocket` protocol object with events: `on_frame_sent`, `on_frame_received`, `on_close`, `on_error`
+  - Access to WebSocket URL and state
+- **File Upload Helpers** - `FilePayload::from_path` and `from_file` for automatic MIME type detection and easier file uploads.
+- **Browser Context Options** - Added support for `RecordHar` and `RecordVideo` configuration (paths, dimensions, filters).
+- **Service Worker Control** - Added `service_workers` option to `BrowserContextOptions`.
+- **Error Handling** - Added `Error::context()` for richer error reporting.
+
+### Breaking Changes
+
+- **Error Enum**: Added `Error::Context` variant. Exhaustive matches on `Error` will need to handle this new variant.
+- **BrowserContextOptions**: Added new public fields (`record_har`, `service_workers`, etc.). Code constructing this struct via struct literal syntax (e.g. `BrowserContextOptions { ... }`) will break; use `BrowserContextOptions::builder()` instead.
+
+### Fixed
+
+- **Event Deserialization** - Fixed `ProtocolError` when parsing `__dispose__` events by correctly handling optional `params` field (Issue #11)
+
+## [0.8.1] - 2026-01-04
+
+### Added
+
+- **Persistent Contexts & App Mode** - Support for `launchPersistentContext` (Issue #9)
+  - `BrowserType::launch_persistent_context(user_data_dir)`
+  - `BrowserType::launch_persistent_context_with_options(user_data_dir, options)`
+  - Full support for `--app=url` argument for standalone application windows
+  - Persistent user data directories for saving session state (cookies, local storage) across runs
+  - Initial page handling for app mode (automatically tracked in `context.pages()`)
+
+## [0.8.0] - 2025-12-30
+
+### Added
+
+- **Typed Evaluate API** - Generic `Page::evaluate()` method with argument serialization and typed results (PR #8)
+  - `Page::evaluate<T: Serialize, U: DeserializeOwned>(expression, arg)` - Fully typed JavaScript evaluation
+  - `Frame::evaluate<T: Serialize>(expression, arg)` - Frame-level evaluation returning `serde_json::Value`
+  - Argument serialization: Pass any `Serialize` type to JavaScript (primitives, structs, arrays, objects)
+  - Result deserialization: Receive typed results with compile-time validation
+  - Backward compatible: Original `evaluate_expression()` and `evaluate_value()` methods preserved
+  - Comprehensive serialization module with Playwright protocol support
+  - Special value handling: Infinity, NaN, -0, circular references, TypedArrays, Dates, BigInt
+  - Example: `evaluate_typed.rs` demonstrating usage patterns
+
+### Community Credit
+
+- Implementation by @douglasob (Douglas Braga)
+
+## [0.7.2] - 2025-12-24
+
+### Added
+
+- **Storage State Support** - `BrowserContextOptions` now supports `storageState` for session persistence (Issue #6)
+  - `storage_state(StorageState)` - Load cookies and localStorage from inline object
+  - `storage_state_path(String)` - Load storage state from JSON file
+  - New types: `Cookie`, `LocalStorageItem`, `Origin`, `StorageState`
+  - Enables authentication state persistence without re-login
+  - Async file reading with proper error handling
+- `Page::pause()` method for manual debugging (Issue #5)
+  - Opens Playwright Inspector and pauses script execution
+  - Delegates to new `BrowserContext::pause()` method
+
+### Fixed
+
+- Protocol serialization for methods with no arguments (fixed `ProtocolError` on `pause`)
+- **Consistent Test Logging** - Refactored all integration tests to explicitly initialize tracing, ensuring protocol errors are captured and visible (Issue #4)
+
+## [0.7.1] - 2025-12-24
+
+### Added
+
+- **Script Injection** - `BrowserContext.add_init_script()` for context-level script injection before page load
+- **Script Injection** - `Page.add_init_script()` for page-level script injection before page load
+- **Style Injection** - `Page.add_style_tag()` for injecting CSS into pages
+  - `AddStyleTagOptions` struct with builder pattern
+  - Support for inline `content` (CSS string)
+  - Support for external `url` (stylesheet URL)
+  - Support for `path` (load CSS from file)
+  - Returns `ElementHandle` to the injected style tag
+
 ## [0.7.0] - 2025-11-16
 
 ### Added
@@ -158,6 +400,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Playwright returns null for data URLs and `about:blank` (valid behavior, not an error)
   - Migration: `page.goto("https://example.com").await?.expect("response")` or use `if let Some(response) = page.goto(...).await? { ... }`
 
-[Unreleased]: https://github.com/padamson/playwright-rust/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/padamson/playwright-rust/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/padamson/playwright-rust/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/padamson/playwright-rust/compare/v0.8.4...v0.8.5
+[0.8.4]: https://github.com/padamson/playwright-rust/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/padamson/playwright-rust/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/padamson/playwright-rust/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/padamson/playwright-rust/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/padamson/playwright-rust/compare/v0.7.2...v0.8.0
+[0.7.2]: https://github.com/padamson/playwright-rust/compare/v0.7.1...v0.7.2
+[0.7.1]: https://github.com/padamson/playwright-rust/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/padamson/playwright-rust/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/padamson/playwright-rust/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/padamson/playwright-rust/releases/tag/v0.6.0

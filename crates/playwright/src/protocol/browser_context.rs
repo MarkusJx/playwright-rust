@@ -4,15 +4,20 @@
 // Multiple contexts can exist in a single browser, each with its own cookies,
 // cache, and local storage.
 
+use crate::api::launch_options::IgnoreDefaultArgs;
 use crate::error::Result;
-use crate::protocol::Page;
+use crate::protocol::api_request_context::APIRequestContext;
+use crate::protocol::route::UnrouteBehavior;
+use crate::protocol::{Browser, Page, ProxySettings, Request, ResponseObject, Route};
 use crate::server::channel::Channel;
 use crate::server::channel_owner::{ChannelOwner, ChannelOwnerImpl, ParentOrConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 /// BrowserContext represents an isolated browser session.
 ///
@@ -38,18 +43,64 @@ use std::sync::Arc;
 ///     let page1 = context1.new_page().await?;
 ///     let page2 = context2.new_page().await?;
 ///
+///     // Access all pages in a context
+///     let pages = context1.pages();
+///     assert_eq!(pages.len(), 1);
+///
+///     // Access the browser from a context
+///     let ctx_browser = context1.browser().unwrap();
+///     assert_eq!(ctx_browser.name(), browser.name());
+///
+///     // App mode: access initial page created automatically
+///     let chromium = playwright.chromium();
+///     let app_context = chromium
+///         .launch_persistent_context_with_options(
+///             "/tmp/app-data",
+///             playwright_rs::protocol::BrowserContextOptions::builder()
+///                 .args(vec!["--app=https://example.com".to_string()])
+///                 .headless(true)
+///                 .build()
+///         )
+///         .await?;
+///
+///     // Get the initial page (don't create a new one!)
+///     let app_pages = app_context.pages();
+///     if !app_pages.is_empty() {
+///         let initial_page = &app_pages[0];
+///         // Use the initial page...
+///     }
+///
 ///     // Cleanup
 ///     context1.close().await?;
 ///     context2.close().await?;
+///     app_context.close().await?;
 ///     browser.close().await?;
 ///     Ok(())
 /// }
 /// ```
 ///
 /// See: <https://playwright.dev/docs/api/class-browsercontext>
+/// Type alias for boxed route handler future
+type RouteHandlerFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+/// Storage for a single route handler
+#[derive(Clone)]
+struct RouteHandlerEntry {
+    pattern: String,
+    handler: Arc<dyn Fn(Route) -> RouteHandlerFuture + Send + Sync>,
+}
+
 #[derive(Clone)]
 pub struct BrowserContext {
     base: ChannelOwnerImpl,
+    /// Browser instance that owns this context (None for persistent contexts)
+    browser: Option<Browser>,
+    /// All open pages in this context
+    pages: Arc<Mutex<Vec<Page>>>,
+    /// Route handlers for context-level network interception
+    route_handlers: Arc<Mutex<Vec<RouteHandlerEntry>>>,
+    /// APIRequestContext GUID from initializer (resolved lazily)
+    request_context_guid: Option<String>,
 }
 
 impl BrowserContext {
@@ -74,28 +125,38 @@ impl BrowserContext {
         guid: Arc<str>,
         initializer: Value,
     ) -> Result<Self> {
+        // Extract APIRequestContext GUID from initializer before moving it
+        let request_context_guid = initializer
+            .get("requestContext")
+            .and_then(|v| v.get("guid"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let base = ChannelOwnerImpl::new(
-            ParentOrConnection::Parent(parent),
+            ParentOrConnection::Parent(parent.clone()),
             type_name,
             guid,
             initializer,
         );
 
-        let context = Self { base };
+        // Store browser reference if parent is a Browser
+        // Returns None only for special contexts (Android, Electron) where parent is not a Browser
+        // For both regular contexts and persistent contexts, parent is a Browser instance
+        let browser = parent.as_any().downcast_ref::<Browser>().cloned();
+
+        let context = Self {
+            base,
+            browser,
+            pages: Arc::new(Mutex::new(Vec::new())),
+            route_handlers: Arc::new(Mutex::new(Vec::new())),
+            request_context_guid,
+        };
 
         // Enable dialog event subscription
         // Dialog events need to be explicitly subscribed to via updateSubscription command
         let channel = context.channel().clone();
         tokio::spawn(async move {
-            let _ = channel
-                .send_no_result(
-                    "updateSubscription",
-                    serde_json::json!({
-                        "event": "dialog",
-                        "enabled": true
-                    }),
-                )
-                .await;
+            _ = channel.update_subscription("dialog", true).await;
         });
 
         Ok(context)
@@ -106,6 +167,31 @@ impl BrowserContext {
     /// Used internally for sending RPC calls to the context.
     fn channel(&self) -> &Channel {
         self.base.channel()
+    }
+
+    /// Adds a script which would be evaluated in one of the following scenarios:
+    ///
+    /// - Whenever a page is created in the browser context or is navigated.
+    /// - Whenever a child frame is attached or navigated in any page in the browser context.
+    ///
+    /// The script is evaluated after the document was created but before any of its scripts
+    /// were run. This is useful to amend the JavaScript environment, e.g. to seed Math.random.
+    ///
+    /// # Arguments
+    ///
+    /// * `script` - Script to be evaluated in all pages in the browser context.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-add-init-script>
+    pub async fn add_init_script(&self, script: &str) -> Result<()> {
+        self.channel()
+            .send_no_result("addInitScript", serde_json::json!({ "source": script }))
+            .await
     }
 
     /// Creates a new page in this browser context.
@@ -150,7 +236,71 @@ impl BrowserContext {
             ))
         })?;
 
+        // Note: Don't track the page here - it will be tracked via the "page" event
+        // that Playwright server sends automatically when a page is created.
+        // Tracking it here would create duplicates.
+
         Ok(page.clone())
+    }
+
+    /// Returns all open pages in the context.
+    ///
+    /// This method provides a snapshot of all currently active pages that belong
+    /// to this browser context instance. Pages created via `new_page()` and popup
+    /// pages opened through user interactions are included.
+    ///
+    /// In persistent contexts launched with `--app=url`, this will include the
+    /// initial page created automatically by Playwright.
+    ///
+    /// # Errors
+    ///
+    /// This method does not return errors. It provides a snapshot of pages at
+    /// the time of invocation.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-pages>
+    pub fn pages(&self) -> Vec<Page> {
+        self.pages.lock().unwrap().clone()
+    }
+
+    /// Returns the browser instance that owns this context.
+    ///
+    /// Returns `None` only for contexts created outside of normal browser
+    /// (e.g., Android or Electron contexts). For both regular contexts and
+    /// persistent contexts, this returns the owning Browser instance.
+    ///
+    /// # Errors
+    ///
+    /// This method does not return errors.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-browser>
+    pub fn browser(&self) -> Option<Browser> {
+        self.browser.clone()
+    }
+
+    /// Returns the APIRequestContext associated with this context.
+    ///
+    /// The APIRequestContext is created automatically by the server for each
+    /// BrowserContext. It enables performing HTTP requests and is used internally
+    /// by `Route::fetch()`.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-request>
+    pub async fn request(&self) -> Result<APIRequestContext> {
+        let guid = self.request_context_guid.as_ref().ok_or_else(|| {
+            crate::error::Error::ProtocolError(
+                "No APIRequestContext available for this context".to_string(),
+            )
+        })?;
+
+        let obj = self.connection().get_object(guid).await?;
+        obj.as_any()
+            .downcast_ref::<APIRequestContext>()
+            .cloned()
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(format!(
+                    "Expected APIRequestContext, got {}",
+                    obj.type_name()
+                ))
+            })
     }
 
     /// Closes the browser context and all its pages.
@@ -170,6 +320,412 @@ impl BrowserContext {
         self.channel()
             .send_no_result("close", serde_json::json!({}))
             .await
+    }
+
+    /// Pauses the browser context.
+    ///
+    /// This pauses the execution of all pages in the context.
+    pub async fn pause(&self) -> Result<()> {
+        self.channel()
+            .send_no_result("pause", serde_json::Value::Null)
+            .await
+    }
+
+    /// Returns storage state for this browser context.
+    ///
+    /// Contains current cookies and local storage snapshots.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-storage-state>
+    pub async fn storage_state(&self) -> Result<StorageState> {
+        let response: StorageState = self
+            .channel()
+            .send("storageState", serde_json::json!({}))
+            .await?;
+        Ok(response)
+    }
+
+    /// Adds cookies into this browser context.
+    ///
+    /// All pages within this context will have these cookies installed. Cookies can be granularly specified
+    /// with `name`, `value`, `url`, `domain`, `path`, `expires`, `httpOnly`, `secure`, `sameSite`.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-add-cookies>
+    pub async fn add_cookies(&self, cookies: &[Cookie]) -> Result<()> {
+        self.channel()
+            .send_no_result(
+                "addCookies",
+                serde_json::json!({
+                    "cookies": cookies
+                }),
+            )
+            .await
+    }
+
+    /// Returns cookies for this browser context, optionally filtered by URLs.
+    ///
+    /// If `urls` is `None` or empty, all cookies are returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `urls` - Optional list of URLs to filter cookies by
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-cookies>
+    pub async fn cookies(&self, urls: Option<&[&str]>) -> Result<Vec<Cookie>> {
+        let url_list: Vec<&str> = urls.unwrap_or(&[]).to_vec();
+        #[derive(serde::Deserialize)]
+        struct CookiesResponse {
+            cookies: Vec<Cookie>,
+        }
+        let response: CookiesResponse = self
+            .channel()
+            .send("cookies", serde_json::json!({ "urls": url_list }))
+            .await?;
+        Ok(response.cookies)
+    }
+
+    /// Clears cookies from this browser context, with optional filters.
+    ///
+    /// When called with no options, all cookies are removed. Use `ClearCookiesOptions`
+    /// to filter which cookies to clear by name, domain, or path.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Optional filters for which cookies to clear
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-clear-cookies>
+    pub async fn clear_cookies(&self, options: Option<ClearCookiesOptions>) -> Result<()> {
+        let params = match options {
+            None => serde_json::json!({}),
+            Some(opts) => serde_json::to_value(opts).unwrap_or(serde_json::json!({})),
+        };
+        self.channel().send_no_result("clearCookies", params).await
+    }
+
+    /// Sets extra HTTP headers that will be sent with every request from this context.
+    ///
+    /// These headers are merged with per-page extra headers set with `page.set_extra_http_headers()`.
+    /// If the page has specific headers that conflict, page-level headers take precedence.
+    ///
+    /// # Arguments
+    ///
+    /// * `headers` - Map of header names to values. All header names are lowercased.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-set-extra-http-headers>
+    pub async fn set_extra_http_headers(&self, headers: HashMap<String, String>) -> Result<()> {
+        // Playwright protocol expects an array of {name, value} objects
+        let headers_array: Vec<serde_json::Value> = headers
+            .into_iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect();
+        self.channel()
+            .send_no_result(
+                "setExtraHTTPHeaders",
+                serde_json::json!({ "headers": headers_array }),
+            )
+            .await
+    }
+
+    /// Grants browser permissions to the context.
+    ///
+    /// Permissions are granted for all pages in the context. The optional `origin`
+    /// in `GrantPermissionsOptions` restricts the grant to a specific URL origin.
+    ///
+    /// Common permissions: `"geolocation"`, `"notifications"`, `"camera"`,
+    /// `"microphone"`, `"clipboard-read"`, `"clipboard-write"`.
+    ///
+    /// # Arguments
+    ///
+    /// * `permissions` - List of permission strings to grant
+    /// * `options` - Optional options, including `origin` to restrict the grant
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Permission name is not recognised
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-grant-permissions>
+    pub async fn grant_permissions(
+        &self,
+        permissions: &[&str],
+        options: Option<GrantPermissionsOptions>,
+    ) -> Result<()> {
+        let mut params = serde_json::json!({ "permissions": permissions });
+        if let Some(opts) = options {
+            if let Some(origin) = opts.origin {
+                params["origin"] = serde_json::Value::String(origin);
+            }
+        }
+        self.channel()
+            .send_no_result("grantPermissions", params)
+            .await
+    }
+
+    /// Clears all permission overrides for this browser context.
+    ///
+    /// Reverts all permissions previously set with `grant_permissions()` back to
+    /// the browser default state.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-clear-permissions>
+    pub async fn clear_permissions(&self) -> Result<()> {
+        self.channel()
+            .send_no_result("clearPermissions", serde_json::json!({}))
+            .await
+    }
+
+    /// Sets or clears the geolocation for all pages in this context.
+    ///
+    /// Pass `Some(Geolocation { ... })` to set a specific location, or `None` to
+    /// clear the override and let the browser handle location requests naturally.
+    ///
+    /// Note: Geolocation access requires the `"geolocation"` permission to be granted
+    /// via `grant_permissions()` for navigator.geolocation to succeed.
+    ///
+    /// # Arguments
+    ///
+    /// * `geolocation` - Location to set, or `None` to clear
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Latitude or longitude is out of range
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-set-geolocation>
+    pub async fn set_geolocation(&self, geolocation: Option<Geolocation>) -> Result<()> {
+        // Playwright protocol: omit the "geolocation" key entirely to clear;
+        // passing null causes a validation error on the server side.
+        let params = match geolocation {
+            Some(geo) => serde_json::json!({ "geolocation": geo }),
+            None => serde_json::json!({}),
+        };
+        self.channel()
+            .send_no_result("setGeolocation", params)
+            .await
+    }
+
+    /// Toggles the offline mode for this browser context.
+    ///
+    /// When `true`, all network requests from pages in this context will fail with
+    /// a network error. Set to `false` to restore network connectivity.
+    ///
+    /// # Arguments
+    ///
+    /// * `offline` - `true` to go offline, `false` to go back online
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Context has been closed
+    /// - Communication with browser process fails
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-set-offline>
+    pub async fn set_offline(&self, offline: bool) -> Result<()> {
+        self.channel()
+            .send_no_result("setOffline", serde_json::json!({ "offline": offline }))
+            .await
+    }
+
+    /// Registers a route handler for context-level network interception.
+    ///
+    /// Routes registered on a context apply to all pages within the context.
+    /// Page-level routes take precedence over context-level routes.
+    ///
+    /// # Arguments
+    ///
+    /// * `pattern` - URL pattern to match (supports glob patterns like "**/*.png")
+    /// * `handler` - Async closure that handles the route
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-route>
+    pub async fn route<F, Fut>(&self, pattern: &str, handler: F) -> Result<()>
+    where
+        F: Fn(Route) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        let handler =
+            Arc::new(move |route: Route| -> RouteHandlerFuture { Box::pin(handler(route)) });
+
+        self.route_handlers.lock().unwrap().push(RouteHandlerEntry {
+            pattern: pattern.to_string(),
+            handler,
+        });
+
+        self.enable_network_interception().await
+    }
+
+    /// Removes route handler(s) matching the given URL pattern.
+    ///
+    /// # Arguments
+    ///
+    /// * `pattern` - URL pattern to remove handlers for
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-unroute>
+    pub async fn unroute(&self, pattern: &str) -> Result<()> {
+        self.route_handlers
+            .lock()
+            .unwrap()
+            .retain(|entry| entry.pattern != pattern);
+        self.enable_network_interception().await
+    }
+
+    /// Removes all registered route handlers.
+    ///
+    /// # Arguments
+    ///
+    /// * `behavior` - Optional behavior for in-flight handlers
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-unroute-all>
+    pub async fn unroute_all(&self, _behavior: Option<UnrouteBehavior>) -> Result<()> {
+        self.route_handlers.lock().unwrap().clear();
+        self.enable_network_interception().await
+    }
+
+    /// Updates network interception patterns for this context
+    async fn enable_network_interception(&self) -> Result<()> {
+        let patterns: Vec<serde_json::Value> = self
+            .route_handlers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| serde_json::json!({ "glob": entry.pattern }))
+            .collect();
+
+        self.channel()
+            .send_no_result(
+                "setNetworkInterceptionPatterns",
+                serde_json::json!({ "patterns": patterns }),
+            )
+            .await
+    }
+
+    /// Handles a route event from the protocol
+    async fn on_route_event(route_handlers: Arc<Mutex<Vec<RouteHandlerEntry>>>, route: Route) {
+        let handlers = route_handlers.lock().unwrap().clone();
+        let url = route.request().url().to_string();
+
+        for entry in handlers.iter().rev() {
+            if crate::protocol::route::matches_pattern(&entry.pattern, &url) {
+                let handler = entry.handler.clone();
+                if let Err(e) = handler(route.clone()).await {
+                    tracing::warn!("Context route handler error: {}", e);
+                    break;
+                }
+                if !route.was_handled() {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    fn dispatch_request_event(&self, method: &str, params: Value) {
+        if let Some(request_guid) = params
+            .get("request")
+            .and_then(|v| v.get("guid"))
+            .and_then(|v| v.as_str())
+        {
+            let connection = self.connection();
+            let request_guid_owned = request_guid.to_owned();
+            let page_guid_owned = params
+                .get("page")
+                .and_then(|v| v.get("guid"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_owned());
+            let method = method.to_owned();
+            tokio::spawn(async move {
+                let request_arc = match connection.get_object(&request_guid_owned).await {
+                    Ok(obj) => obj,
+                    Err(_err) => return,
+                };
+
+                let request = match request_arc.as_any().downcast_ref::<Request>() {
+                    Some(v) => v.clone(),
+                    None => return,
+                };
+
+                if let Some(page_guid) = page_guid_owned {
+                    let page_arc = match connection.get_object(&page_guid).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let page = match page_arc.as_any().downcast_ref::<Page>() {
+                        Some(p) => p,
+                        None => return,
+                    };
+                    match method.as_str() {
+                        "request" => page.trigger_request_event(request).await,
+                        "requestFailed" => page.trigger_request_failed_event(request).await,
+                        "requestFinished" => page.trigger_request_finished_event(request).await,
+                        _ => unreachable!("Unreachable method {}", method),
+                    }
+                }
+            });
+        }
+    }
+
+    fn dispatch_response_event(&self, _method: &str, params: Value) {
+        if let Some(response_guid) = params
+            .get("response")
+            .and_then(|v| v.get("guid"))
+            .and_then(|v| v.as_str())
+        {
+            let connection = self.connection();
+            let response_guid_owned = response_guid.to_owned();
+            let page_guid_owned = params
+                .get("page")
+                .and_then(|v| v.get("guid"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_owned());
+            tokio::spawn(async move {
+                let response_arc = match connection.get_object(&response_guid_owned).await {
+                    Ok(obj) => obj,
+                    Err(_err) => return,
+                };
+
+                let response = match response_arc.as_any().downcast_ref::<ResponseObject>() {
+                    Some(v) => v.clone(),
+                    None => return,
+                };
+
+                if let Some(page_guid) = page_guid_owned {
+                    let page_arc = match connection.get_object(&page_guid).await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let page = match page_arc.as_any().downcast_ref::<Page>() {
+                        Some(p) => p,
+                        None => return,
+                    };
+                    page.trigger_response_event(response).await;
+                }
+            });
+        }
     }
 }
 
@@ -216,6 +772,42 @@ impl ChannelOwner for BrowserContext {
 
     fn on_event(&self, method: &str, params: Value) {
         match method {
+            "request" | "requestFailed" | "requestFinished" => {
+                self.dispatch_request_event(method, params)
+            }
+            "response" => self.dispatch_response_event(method, params),
+            "page" => {
+                // Page events are triggered when pages are created, including:
+                // - Initial page in persistent context with --app mode
+                // - Popup pages opened through user interactions
+                // Event format: {page: {guid: "..."}}
+                if let Some(page_guid) = params
+                    .get("page")
+                    .and_then(|v| v.get("guid"))
+                    .and_then(|v| v.as_str())
+                {
+                    let connection = self.connection();
+                    let page_guid_owned = page_guid.to_string();
+                    let pages = self.pages.clone();
+
+                    tokio::spawn(async move {
+                        // Get the Page object
+                        let page_arc = match connection.get_object(&page_guid_owned).await {
+                            Ok(obj) => obj,
+                            Err(_) => return,
+                        };
+
+                        // Downcast to Page
+                        let page = match page_arc.as_any().downcast_ref::<Page>() {
+                            Some(p) => p.clone(),
+                            None => return,
+                        };
+
+                        // Track the page
+                        pages.lock().unwrap().push(page);
+                    });
+                }
+            }
             "dialog" => {
                 // Dialog events come to BrowserContext, need to forward to the associated Page
                 // Event format: {dialog: {guid: "..."}}
@@ -258,6 +850,50 @@ impl ChannelOwner for BrowserContext {
 
                         // Forward to Page's dialog handlers
                         page.trigger_dialog_event(dialog).await;
+                    });
+                }
+            }
+            "route" => {
+                // Handle context-level network routing event
+                if let Some(route_guid) = params
+                    .get("route")
+                    .and_then(|v| v.get("guid"))
+                    .and_then(|v| v.as_str())
+                {
+                    let connection = self.connection();
+                    let route_guid_owned = route_guid.to_string();
+                    let route_handlers = self.route_handlers.clone();
+                    let request_context_guid = self.request_context_guid.clone();
+
+                    tokio::spawn(async move {
+                        let route_arc = match connection.get_object(&route_guid_owned).await {
+                            Ok(obj) => obj,
+                            Err(e) => {
+                                tracing::warn!("Failed to get route object: {}", e);
+                                return;
+                            }
+                        };
+
+                        let route = match route_arc.as_any().downcast_ref::<Route>() {
+                            Some(r) => r.clone(),
+                            None => {
+                                tracing::warn!("Failed to downcast to Route");
+                                return;
+                            }
+                        };
+
+                        // Set APIRequestContext on the route for fetch() support
+                        if let Some(ref guid) = request_context_guid {
+                            if let Ok(obj) = connection.get_object(guid).await {
+                                if let Some(api_ctx) =
+                                    obj.as_any().downcast_ref::<APIRequestContext>()
+                                {
+                                    route.set_api_request_context(api_ctx.clone());
+                                }
+                            }
+                        }
+
+                        BrowserContext::on_route_event(route_handlers, route).await;
                     });
                 }
             }
@@ -309,6 +945,133 @@ pub struct Geolocation {
     pub accuracy: Option<f64>,
 }
 
+/// Cookie information for storage state.
+///
+/// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-storage-state>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cookie {
+    /// Cookie name
+    pub name: String,
+    /// Cookie value
+    pub value: String,
+    /// Cookie domain (use dot prefix for subdomain matching, e.g., ".example.com")
+    pub domain: String,
+    /// Cookie path
+    pub path: String,
+    /// Unix timestamp in seconds; -1 for session cookies
+    pub expires: f64,
+    /// HTTP-only flag
+    pub http_only: bool,
+    /// Secure flag
+    pub secure: bool,
+    /// SameSite attribute ("Strict", "Lax", "None")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub same_site: Option<String>,
+}
+
+/// Local storage item for storage state.
+///
+/// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-storage-state>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalStorageItem {
+    /// Storage key
+    pub name: String,
+    /// Storage value
+    pub value: String,
+}
+
+/// Origin with local storage items for storage state.
+///
+/// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-storage-state>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Origin {
+    /// Origin URL (e.g., `https://example.com`)
+    pub origin: String,
+    /// Local storage items for this origin
+    pub local_storage: Vec<LocalStorageItem>,
+}
+
+/// Storage state containing cookies and local storage.
+///
+/// Used to populate a browser context with saved authentication state,
+/// enabling session persistence across context instances.
+///
+/// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-storage-state>
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageState {
+    /// List of cookies
+    pub cookies: Vec<Cookie>,
+    /// List of origins with local storage
+    pub origins: Vec<Origin>,
+}
+
+/// Options for filtering which cookies to clear with `BrowserContext::clear_cookies()`.
+///
+/// All fields are optional; when provided they act as AND-combined filters.
+///
+/// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-clear-cookies>
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearCookiesOptions {
+    /// Filter by cookie name (exact match).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Filter by cookie domain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Filter by cookie path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Options for `BrowserContext::grant_permissions()`.
+///
+/// See: <https://playwright.dev/docs/api/class-browsercontext#browser-context-grant-permissions>
+#[derive(Debug, Clone, Default)]
+pub struct GrantPermissionsOptions {
+    /// Optional origin to restrict the permission grant to.
+    ///
+    /// For example `"https://example.com"`.
+    pub origin: Option<String>,
+}
+
+/// Options for recording HAR.
+///
+/// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-record-har>
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordHar {
+    /// Path on the filesystem to write the HAR file to.
+    pub path: String,
+    /// Optional setting to control whether to omit request content from the HAR.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub omit_content: Option<bool>,
+    /// Optional setting to control resource content management.
+    /// "omit" | "embed" | "attach"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// "full" | "minimal"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// A glob or regex pattern to filter requests that are stored in the HAR.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url_filter: Option<String>,
+}
+
+/// Options for recording video.
+///
+/// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-record-video>
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct RecordVideo {
+    /// Path to the directory to put videos into.
+    pub dir: String,
+    /// Optional dimensions of the recorded videos.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<Viewport>,
+}
+
 /// Options for creating a new browser context.
 ///
 /// Allows customizing viewport, user agent, locale, timezone, geolocation,
@@ -324,7 +1087,11 @@ pub struct BrowserContextOptions {
     pub viewport: Option<Viewport>,
 
     /// Disables viewport emulation when set to true.
+    /// Note: Playwright's public API calls this `noViewport`, but the protocol
+    /// expects `noDefaultViewport`. playwright-python applies this transformation
+    /// in `_prepare_browser_context_params`.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "noDefaultViewport")]
     pub no_viewport: Option<bool>,
 
     /// Custom user agent string
@@ -346,6 +1113,10 @@ pub struct BrowserContextOptions {
     /// List of permissions to grant (e.g., "geolocation", "notifications")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Vec<String>>,
+
+    /// Network proxy settings
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<ProxySettings>,
 
     /// Emulates 'prefers-colors-scheme' media feature ("light", "dark", "no-preference")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,6 +1161,94 @@ pub struct BrowserContextOptions {
     /// Base URL for relative navigation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+
+    /// Storage state to populate the context (cookies, localStorage, sessionStorage).
+    /// Can be an inline StorageState object or a file path string.
+    /// Use builder methods `storage_state()` for inline or `storage_state_path()` for file path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_state: Option<StorageState>,
+
+    /// Storage state file path (alternative to inline storage_state).
+    /// This is handled by the builder and converted to storage_state during serialization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_state_path: Option<String>,
+
+    // Launch options (for launch_persistent_context)
+    /// Additional arguments to pass to browser instance
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+
+    /// Browser distribution channel (e.g., "chrome", "msedge")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+
+    /// Enable Chromium sandboxing (default: false on Linux)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chromium_sandbox: Option<bool>,
+
+    /// Auto-open DevTools (deprecated, default: false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub devtools: Option<bool>,
+
+    /// Directory to save downloads
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloads_path: Option<String>,
+
+    /// Path to custom browser executable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+
+    /// Firefox user preferences (Firefox only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firefox_user_prefs: Option<HashMap<String, serde_json::Value>>,
+
+    /// Run in headless mode (default: true unless devtools=true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headless: Option<bool>,
+
+    /// Filter or disable default browser arguments.
+    /// When `true`, Playwright does not pass its own default args.
+    /// When an array, filters out the given default arguments.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsertype#browser-type-launch-persistent-context>
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_default_args: Option<IgnoreDefaultArgs>,
+
+    /// Slow down operations by N milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_mo: Option<f64>,
+
+    /// Timeout for browser launch in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+
+    /// Directory to save traces
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traces_dir: Option<String>,
+
+    /// Check if strict selectors mode is enabled
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict_selectors: Option<bool>,
+
+    /// Emulates 'prefers-reduced-motion' media feature
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduced_motion: Option<String>,
+
+    /// Emulates 'forced-colors' media feature
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forced_colors: Option<String>,
+
+    /// Whether to allow sites to register Service workers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_workers: Option<String>,
+
+    /// Options for recording HAR
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_har: Option<RecordHar>,
+
+    /// Options for recording video
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_video: Option<RecordVideo>,
 }
 
 impl BrowserContextOptions {
@@ -409,6 +1268,7 @@ pub struct BrowserContextOptionsBuilder {
     timezone_id: Option<String>,
     geolocation: Option<Geolocation>,
     permissions: Option<Vec<String>>,
+    proxy: Option<ProxySettings>,
     color_scheme: Option<String>,
     has_touch: Option<bool>,
     is_mobile: Option<bool>,
@@ -420,6 +1280,27 @@ pub struct BrowserContextOptionsBuilder {
     device_scale_factor: Option<f64>,
     extra_http_headers: Option<HashMap<String, String>>,
     base_url: Option<String>,
+    storage_state: Option<StorageState>,
+    storage_state_path: Option<String>,
+    // Launch options
+    args: Option<Vec<String>>,
+    channel: Option<String>,
+    chromium_sandbox: Option<bool>,
+    devtools: Option<bool>,
+    downloads_path: Option<String>,
+    executable_path: Option<String>,
+    firefox_user_prefs: Option<HashMap<String, serde_json::Value>>,
+    headless: Option<bool>,
+    ignore_default_args: Option<IgnoreDefaultArgs>,
+    slow_mo: Option<f64>,
+    timeout: Option<f64>,
+    traces_dir: Option<String>,
+    strict_selectors: Option<bool>,
+    reduced_motion: Option<String>,
+    forced_colors: Option<String>,
+    service_workers: Option<String>,
+    record_har: Option<RecordHar>,
+    record_video: Option<RecordVideo>,
 }
 
 impl BrowserContextOptionsBuilder {
@@ -466,6 +1347,32 @@ impl BrowserContextOptionsBuilder {
     /// Sets the permissions to grant
     pub fn permissions(mut self, permissions: Vec<String>) -> Self {
         self.permissions = Some(permissions);
+        self
+    }
+
+    /// Sets the network proxy settings for this context.
+    ///
+    /// This allows routing all network traffic through a proxy server,
+    /// useful for rotating proxies without creating new browsers.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use playwright_rs::protocol::{BrowserContextOptions, ProxySettings};
+    ///
+    /// let options = BrowserContextOptions::builder()
+    ///     .proxy(ProxySettings {
+    ///         server: "http://proxy.example.com:8080".to_string(),
+    ///         bypass: Some(".example.com".to_string()),
+    ///         username: Some("user".to_string()),
+    ///         password: Some("pass".to_string()),
+    ///     })
+    ///     .build();
+    /// ```
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browser#browser-new-context>
+    pub fn proxy(mut self, proxy: ProxySettings) -> Self {
+        self.proxy = Some(proxy);
         self
     }
 
@@ -535,6 +1442,213 @@ impl BrowserContextOptionsBuilder {
         self
     }
 
+    /// Sets the storage state inline (cookies, localStorage).
+    ///
+    /// Populates the browser context with the provided storage state, including
+    /// cookies and local storage. This is useful for initializing a context with
+    /// a saved authentication state.
+    ///
+    /// Mutually exclusive with `storage_state_path()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use playwright_rs::protocol::{BrowserContextOptions, Cookie, StorageState, Origin, LocalStorageItem};
+    ///
+    /// let storage_state = StorageState {
+    ///     cookies: vec![Cookie {
+    ///         name: "session_id".to_string(),
+    ///         value: "abc123".to_string(),
+    ///         domain: ".example.com".to_string(),
+    ///         path: "/".to_string(),
+    ///         expires: -1.0,
+    ///         http_only: true,
+    ///         secure: true,
+    ///         same_site: Some("Lax".to_string()),
+    ///     }],
+    ///     origins: vec![Origin {
+    ///         origin: "https://example.com".to_string(),
+    ///         local_storage: vec![LocalStorageItem {
+    ///             name: "user_prefs".to_string(),
+    ///             value: "{\"theme\":\"dark\"}".to_string(),
+    ///         }],
+    ///     }],
+    /// };
+    ///
+    /// let options = BrowserContextOptions::builder()
+    ///     .storage_state(storage_state)
+    ///     .build();
+    /// ```
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-storage-state>
+    pub fn storage_state(mut self, storage_state: StorageState) -> Self {
+        self.storage_state = Some(storage_state);
+        self.storage_state_path = None; // Clear path if setting inline
+        self
+    }
+
+    /// Sets the storage state from a file path.
+    ///
+    /// The file should contain a JSON representation of StorageState with cookies
+    /// and origins. This is useful for loading authentication state saved from a
+    /// previous session.
+    ///
+    /// Mutually exclusive with `storage_state()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use playwright_rs::protocol::BrowserContextOptions;
+    ///
+    /// let options = BrowserContextOptions::builder()
+    ///     .storage_state_path("auth.json".to_string())
+    ///     .build();
+    /// ```
+    ///
+    /// The file should have this format:
+    /// ```json
+    /// {
+    ///   "cookies": [{
+    ///     "name": "session_id",
+    ///     "value": "abc123",
+    ///     "domain": ".example.com",
+    ///     "path": "/",
+    ///     "expires": -1,
+    ///     "httpOnly": true,
+    ///     "secure": true,
+    ///     "sameSite": "Lax"
+    ///   }],
+    ///   "origins": [{
+    ///     "origin": "https://example.com",
+    ///     "localStorage": [{
+    ///       "name": "user_prefs",
+    ///       "value": "{\"theme\":\"dark\"}"
+    ///     }]
+    ///   }]
+    /// }
+    /// ```
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browser#browser-new-context-option-storage-state>
+    pub fn storage_state_path(mut self, path: String) -> Self {
+        self.storage_state_path = Some(path);
+        self.storage_state = None; // Clear inline if setting path
+        self
+    }
+
+    /// Sets additional arguments to pass to browser instance (for launch_persistent_context)
+    pub fn args(mut self, args: Vec<String>) -> Self {
+        self.args = Some(args);
+        self
+    }
+
+    /// Sets browser distribution channel (for launch_persistent_context)
+    pub fn channel(mut self, channel: String) -> Self {
+        self.channel = Some(channel);
+        self
+    }
+
+    /// Enables or disables Chromium sandboxing (for launch_persistent_context)
+    pub fn chromium_sandbox(mut self, enabled: bool) -> Self {
+        self.chromium_sandbox = Some(enabled);
+        self
+    }
+
+    /// Auto-open DevTools (for launch_persistent_context)
+    pub fn devtools(mut self, enabled: bool) -> Self {
+        self.devtools = Some(enabled);
+        self
+    }
+
+    /// Sets directory to save downloads (for launch_persistent_context)
+    pub fn downloads_path(mut self, path: String) -> Self {
+        self.downloads_path = Some(path);
+        self
+    }
+
+    /// Sets path to custom browser executable (for launch_persistent_context)
+    pub fn executable_path(mut self, path: String) -> Self {
+        self.executable_path = Some(path);
+        self
+    }
+
+    /// Sets Firefox user preferences (for launch_persistent_context, Firefox only)
+    pub fn firefox_user_prefs(mut self, prefs: HashMap<String, serde_json::Value>) -> Self {
+        self.firefox_user_prefs = Some(prefs);
+        self
+    }
+
+    /// Run in headless mode (for launch_persistent_context)
+    pub fn headless(mut self, enabled: bool) -> Self {
+        self.headless = Some(enabled);
+        self
+    }
+
+    /// Filter or disable default browser arguments (for launch_persistent_context).
+    ///
+    /// When `IgnoreDefaultArgs::Bool(true)`, Playwright does not pass its own
+    /// default arguments and only uses the ones from `args`.
+    /// When `IgnoreDefaultArgs::Array(vec)`, filters out the given default arguments.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-browsertype#browser-type-launch-persistent-context>
+    pub fn ignore_default_args(mut self, args: IgnoreDefaultArgs) -> Self {
+        self.ignore_default_args = Some(args);
+        self
+    }
+
+    /// Slow down operations by N milliseconds (for launch_persistent_context)
+    pub fn slow_mo(mut self, ms: f64) -> Self {
+        self.slow_mo = Some(ms);
+        self
+    }
+
+    /// Set timeout for browser launch in milliseconds (for launch_persistent_context)
+    pub fn timeout(mut self, ms: f64) -> Self {
+        self.timeout = Some(ms);
+        self
+    }
+
+    /// Set directory to save traces (for launch_persistent_context)
+    pub fn traces_dir(mut self, path: String) -> Self {
+        self.traces_dir = Some(path);
+        self
+    }
+
+    /// Check if strict selectors mode is enabled
+    pub fn strict_selectors(mut self, enabled: bool) -> Self {
+        self.strict_selectors = Some(enabled);
+        self
+    }
+
+    /// Emulates 'prefers-reduced-motion' media feature
+    pub fn reduced_motion(mut self, value: String) -> Self {
+        self.reduced_motion = Some(value);
+        self
+    }
+
+    /// Emulates 'forced-colors' media feature
+    pub fn forced_colors(mut self, value: String) -> Self {
+        self.forced_colors = Some(value);
+        self
+    }
+
+    /// Whether to allow sites to register Service workers ("allow" | "block")
+    pub fn service_workers(mut self, value: String) -> Self {
+        self.service_workers = Some(value);
+        self
+    }
+
+    /// Sets options for recording HAR
+    pub fn record_har(mut self, record_har: RecordHar) -> Self {
+        self.record_har = Some(record_har);
+        self
+    }
+
+    /// Sets options for recording video
+    pub fn record_video(mut self, record_video: RecordVideo) -> Self {
+        self.record_video = Some(record_video);
+        self
+    }
+
     /// Builds the BrowserContextOptions
     pub fn build(self) -> BrowserContextOptions {
         BrowserContextOptions {
@@ -545,6 +1659,7 @@ impl BrowserContextOptionsBuilder {
             timezone_id: self.timezone_id,
             geolocation: self.geolocation,
             permissions: self.permissions,
+            proxy: self.proxy,
             color_scheme: self.color_scheme,
             has_touch: self.has_touch,
             is_mobile: self.is_mobile,
@@ -556,6 +1671,61 @@ impl BrowserContextOptionsBuilder {
             device_scale_factor: self.device_scale_factor,
             extra_http_headers: self.extra_http_headers,
             base_url: self.base_url,
+            storage_state: self.storage_state,
+            storage_state_path: self.storage_state_path,
+            // Launch options
+            args: self.args,
+            channel: self.channel,
+            chromium_sandbox: self.chromium_sandbox,
+            devtools: self.devtools,
+            downloads_path: self.downloads_path,
+            executable_path: self.executable_path,
+            firefox_user_prefs: self.firefox_user_prefs,
+            headless: self.headless,
+            ignore_default_args: self.ignore_default_args,
+            slow_mo: self.slow_mo,
+            timeout: self.timeout,
+            traces_dir: self.traces_dir,
+            strict_selectors: self.strict_selectors,
+            reduced_motion: self.reduced_motion,
+            forced_colors: self.forced_colors,
+            service_workers: self.service_workers,
+            record_har: self.record_har,
+            record_video: self.record_video,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::launch_options::IgnoreDefaultArgs;
+
+    #[test]
+    fn test_browser_context_options_ignore_default_args_bool_serialization() {
+        let options = BrowserContextOptions::builder()
+            .ignore_default_args(IgnoreDefaultArgs::Bool(true))
+            .build();
+
+        let value = serde_json::to_value(&options).unwrap();
+        assert_eq!(value["ignoreDefaultArgs"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_browser_context_options_ignore_default_args_array_serialization() {
+        let options = BrowserContextOptions::builder()
+            .ignore_default_args(IgnoreDefaultArgs::Array(vec!["--foo".to_string()]))
+            .build();
+
+        let value = serde_json::to_value(&options).unwrap();
+        assert_eq!(value["ignoreDefaultArgs"], serde_json::json!(["--foo"]));
+    }
+
+    #[test]
+    fn test_browser_context_options_ignore_default_args_absent() {
+        let options = BrowserContextOptions::builder().build();
+
+        let value = serde_json::to_value(&options).unwrap();
+        assert!(value.get("ignoreDefaultArgs").is_none());
     }
 }

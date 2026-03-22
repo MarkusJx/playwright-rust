@@ -213,7 +213,7 @@ mod tests {
 
         match result {
             Ok(server) => {
-                println!("Server launched successfully!");
+                tracing::info!("Server launched successfully!");
                 // Clean shutdown
                 let shutdown_result = server.shutdown().await;
                 assert!(
@@ -224,15 +224,17 @@ mod tests {
             }
             Err(Error::ServerNotFound) => {
                 // This can happen if npm is not installed or download fails
-                eprintln!(
+                tracing::warn!(
                     "Could not launch server: Playwright not found and download may have failed"
                 );
-                eprintln!("To run this test, install Playwright manually: npm install playwright");
+                tracing::warn!(
+                    "To run this test, install Playwright manually: npm install playwright"
+                );
                 // Don't fail the test - this is expected in CI without Node.js
             }
             Err(Error::LaunchFailed(msg)) => {
-                eprintln!("Launch failed: {}", msg);
-                eprintln!("This may be expected if Node.js or npm is not installed");
+                tracing::warn!("Launch failed: {}", msg);
+                tracing::warn!("This may be expected if Node.js or npm is not installed");
                 // Don't fail - expected in environments without Node.js
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
@@ -245,12 +247,12 @@ mod tests {
         let result = PlaywrightServer::launch().await;
 
         if let Ok(server) = result {
-            println!("Server launched, testing kill...");
+            tracing::info!("Server launched, testing kill...");
             let kill_result = server.kill().await;
             assert!(kill_result.is_ok(), "Kill failed: {:?}", kill_result);
         } else {
             // Server didn't launch, that's okay for this test
-            eprintln!("Server didn't launch (expected without Node.js/Playwright)");
+            tracing::warn!("Server didn't launch (expected without Node.js/Playwright)");
         }
     }
 }

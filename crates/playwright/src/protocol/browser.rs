@@ -210,11 +210,12 @@ impl Browser {
     /// - Browser has been closed
     /// - Communication with browser process fails
     /// - Invalid options provided
+    /// - Storage state file cannot be read or parsed
     ///
     /// See: <https://playwright.dev/docs/api/class-browser#browser-new-context>
     pub async fn new_context_with_options(
         &self,
-        options: crate::protocol::BrowserContextOptions,
+        mut options: crate::protocol::BrowserContextOptions,
     ) -> Result<BrowserContext> {
         // Response contains the GUID of the created BrowserContext
         #[derive(Deserialize)]
@@ -226,6 +227,27 @@ impl Browser {
         struct GuidRef {
             #[serde(deserialize_with = "crate::server::connection::deserialize_arc_str")]
             guid: Arc<str>,
+        }
+
+        // Handle storage_state_path: read file and convert to inline storage_state
+        if let Some(path) = &options.storage_state_path {
+            let file_content = tokio::fs::read_to_string(path).await.map_err(|e| {
+                crate::error::Error::ProtocolError(format!(
+                    "Failed to read storage state file '{}': {}",
+                    path, e
+                ))
+            })?;
+
+            let storage_state: crate::protocol::StorageState = serde_json::from_str(&file_content)
+                .map_err(|e| {
+                    crate::error::Error::ProtocolError(format!(
+                        "Failed to parse storage state file '{}': {}",
+                        path, e
+                    ))
+                })?;
+
+            options.storage_state = Some(storage_state);
+            options.storage_state_path = None; // Clear path since we've converted to inline
         }
 
         // Convert options to JSON
@@ -303,7 +325,7 @@ impl Browser {
         {
             let is_ci = std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok();
             if is_ci {
-                eprintln!("[playwright-rust] Adding Windows CI browser cleanup delay");
+                tracing::debug!("[playwright-rust] Adding Windows CI browser cleanup delay");
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }

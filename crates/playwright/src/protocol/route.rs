@@ -1,16 +1,18 @@
 // Route protocol object
 //
 // Represents a route handler for network interception.
-// Routes are created when page.route() matches a request.
+// Routes are created when page.route() or context.route() matches a request.
 //
 // See: https://playwright.dev/docs/api/class-route
 
 use crate::error::Result;
 use crate::protocol::Request;
+use crate::protocol::api_request_context::{APIRequestContext, InnerFetchOptions};
 use crate::server::channel_owner::{ChannelOwner, ChannelOwnerImpl, ParentOrConnection};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Route represents a network route handler.
 ///
@@ -20,6 +22,12 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct Route {
     base: ChannelOwnerImpl,
+    /// Tracks whether the route has been fully handled (abort/continue/fulfill).
+    /// Used by fallback() to signal that handler chaining should continue.
+    handled: Arc<AtomicBool>,
+    /// APIRequestContext for performing fetch operations.
+    /// Set by the route event dispatcher (Page or BrowserContext).
+    api_request_context: Arc<Mutex<Option<APIRequestContext>>>,
 }
 
 impl Route {
@@ -40,7 +48,27 @@ impl Route {
             initializer,
         );
 
-        Ok(Self { base })
+        Ok(Self {
+            base,
+            handled: Arc::new(AtomicBool::new(false)),
+            api_request_context: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Returns whether this route was fully handled by a handler.
+    ///
+    /// Returns `false` if the handler called `fallback()`, indicating the next
+    /// matching handler should be tried.
+    pub(crate) fn was_handled(&self) -> bool {
+        self.handled.load(Ordering::SeqCst)
+    }
+
+    /// Sets the APIRequestContext for this route, enabling `fetch()`.
+    ///
+    /// Called by the route event dispatcher (Page or BrowserContext) when
+    /// dispatching the route to a handler.
+    pub(crate) fn set_api_request_context(&self, ctx: APIRequestContext) {
+        *self.api_request_context.lock().unwrap() = Some(ctx);
     }
 
     /// Returns the request that is being routed.
@@ -105,6 +133,7 @@ impl Route {
     ///
     /// See: <https://playwright.dev/docs/api/class-route#route-abort>
     pub async fn abort(&self, error_code: Option<&str>) -> Result<()> {
+        self.handled.store(true, Ordering::SeqCst);
         let params = json!({
             "errorCode": error_code.unwrap_or("failed")
         });
@@ -117,14 +146,43 @@ impl Route {
 
     /// Continues the route's request with optional modifications.
     ///
+    /// This is a final action — no other route handlers will run for this request.
+    /// Use `fallback()` instead if you want subsequent handlers to have a chance.
+    ///
     /// # Arguments
     ///
     /// * `overrides` - Optional modifications to apply to the request
     ///
     /// See: <https://playwright.dev/docs/api/class-route#route-continue>
     pub async fn continue_(&self, overrides: Option<ContinueOptions>) -> Result<()> {
+        self.handled.store(true, Ordering::SeqCst);
+        self.continue_internal(overrides, false).await
+    }
+
+    /// Continues the route's request, allowing subsequent handlers to run.
+    ///
+    /// Unlike `continue_()`, `fallback()` yields to the next matching handler in the
+    /// chain before the request reaches the network. This enables middleware-like
+    /// handler composition where multiple handlers can inspect and modify a request.
+    ///
+    /// # Arguments
+    ///
+    /// * `overrides` - Optional modifications to apply to the request
+    ///
+    /// See: <https://playwright.dev/docs/api/class-route#route-fallback>
+    pub async fn fallback(&self, overrides: Option<ContinueOptions>) -> Result<()> {
+        // Don't set handled — signals to the dispatcher to try the next handler
+        self.continue_internal(overrides, true).await
+    }
+
+    /// Internal implementation shared by continue_() and fallback()
+    async fn continue_internal(
+        &self,
+        overrides: Option<ContinueOptions>,
+        is_fallback: bool,
+    ) -> Result<()> {
         let mut params = json!({
-            "isFallback": false
+            "isFallback": is_fallback
         });
 
         // Add overrides if provided
@@ -193,6 +251,7 @@ impl Route {
     ///
     /// See: <https://playwright.dev/docs/api/class-route#route-fulfill>
     pub async fn fulfill(&self, options: Option<FulfillOptions>) -> Result<()> {
+        self.handled.store(true, Ordering::SeqCst);
         let opts = options.unwrap_or_default();
 
         // Build the response object for the protocol
@@ -245,11 +304,146 @@ impl Route {
             .await
             .map(|_| ())
     }
+
+    /// Performs the request and fetches result without fulfilling it, so that the
+    /// response can be modified and then fulfilled.
+    ///
+    /// Delegates to `APIRequestContext.inner_fetch()` using the request's URL and
+    /// any provided overrides.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Optional overrides for the fetch request
+    ///
+    /// See: <https://playwright.dev/docs/api/class-route#route-fetch>
+    pub async fn fetch(&self, options: Option<FetchOptions>) -> Result<FetchResponse> {
+        self.handled.store(true, Ordering::SeqCst);
+
+        let api_ctx = self
+            .api_request_context
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| {
+                crate::error::Error::ProtocolError(
+                    "No APIRequestContext available for route.fetch(). \
+                     This can happen if the route was not dispatched through \
+                     a BrowserContext with an associated request context."
+                        .to_string(),
+                )
+            })?;
+
+        let request = self.request();
+        let opts = options.unwrap_or_default();
+
+        // Use the original request URL unless overridden
+        let url = opts.url.unwrap_or_else(|| request.url().to_string());
+
+        let inner_opts = InnerFetchOptions {
+            method: opts.method.or_else(|| Some(request.method().to_string())),
+            headers: opts.headers,
+            post_data: opts.post_data,
+            post_data_bytes: opts.post_data_bytes,
+            max_redirects: opts.max_redirects,
+            max_retries: opts.max_retries,
+            timeout: opts.timeout,
+        };
+
+        api_ctx.inner_fetch(&url, Some(inner_opts)).await
+    }
+}
+
+/// Checks if a URL matches a glob pattern.
+///
+/// Supports standard glob patterns:
+/// - `*` matches any characters except `/`
+/// - `**` matches any characters including `/`
+/// - `?` matches a single character
+pub(crate) fn matches_pattern(pattern: &str, url: &str) -> bool {
+    use glob::Pattern;
+
+    match Pattern::new(pattern) {
+        Ok(glob_pattern) => glob_pattern.matches(url),
+        Err(_) => {
+            // If pattern is invalid, fall back to exact string match
+            pattern == url
+        }
+    }
+}
+
+/// Behavior when removing route handlers via `unroute_all()`.
+///
+/// See: <https://playwright.dev/docs/api/class-page#page-unroute-all>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnrouteBehavior {
+    /// Wait for in-flight handlers to complete before removing
+    Wait,
+    /// Stop handlers and ignore any errors they throw
+    IgnoreErrors,
+    /// Default behavior (does not wait, does not ignore errors)
+    Default,
+}
+
+/// Response from `route.fetch()`, allowing inspection and modification before fulfillment.
+///
+/// See: <https://playwright.dev/docs/api/class-apiresponse>
+#[derive(Debug, Clone)]
+pub struct FetchResponse {
+    /// HTTP status code
+    pub status: u16,
+    /// HTTP status text
+    pub status_text: String,
+    /// Response headers as name-value pairs
+    pub headers: Vec<(String, String)>,
+    /// Response body as bytes
+    pub body: Vec<u8>,
+}
+
+impl FetchResponse {
+    /// Returns the HTTP status code
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Returns the status text
+    pub fn status_text(&self) -> &str {
+        &self.status_text
+    }
+
+    /// Returns response headers
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// Returns the response body as bytes
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Returns the response body as text
+    pub fn text(&self) -> Result<String> {
+        String::from_utf8(self.body.clone()).map_err(|e| {
+            crate::error::Error::ProtocolError(format!("Response body is not valid UTF-8: {}", e))
+        })
+    }
+
+    /// Returns the response body parsed as JSON
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body).map_err(|e| {
+            crate::error::Error::ProtocolError(format!("Failed to parse response JSON: {}", e))
+        })
+    }
+
+    /// Returns true if status is in 200-299 range
+    pub fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
 }
 
 /// Options for continuing a request with modifications.
 ///
 /// Allows modifying headers, method, post data, and URL when continuing a route.
+/// Used by both `continue_()` and `fallback()`.
 ///
 /// See: <https://playwright.dev/docs/api/class-route#route-continue>
 #[derive(Debug, Clone, Default)]
@@ -407,6 +601,115 @@ impl FulfillOptionsBuilder {
             headers: self.headers,
             body: self.body,
             content_type: self.content_type,
+        }
+    }
+}
+
+/// Options for fetching a route's request.
+///
+/// See: <https://playwright.dev/docs/api/class-route#route-fetch>
+#[derive(Debug, Clone, Default)]
+pub struct FetchOptions {
+    /// Modified request headers
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// Modified request method (GET, POST, etc.)
+    pub method: Option<String>,
+    /// Modified POST data as string
+    pub post_data: Option<String>,
+    /// Modified POST data as bytes
+    pub post_data_bytes: Option<Vec<u8>>,
+    /// Modified request URL
+    pub url: Option<String>,
+    /// Maximum number of redirects to follow (default: 20)
+    pub max_redirects: Option<u32>,
+    /// Maximum number of retries (default: 0)
+    pub max_retries: Option<u32>,
+    /// Request timeout in milliseconds
+    pub timeout: Option<f64>,
+}
+
+impl FetchOptions {
+    /// Creates a new FetchOptions builder
+    pub fn builder() -> FetchOptionsBuilder {
+        FetchOptionsBuilder::default()
+    }
+}
+
+/// Builder for FetchOptions
+#[derive(Debug, Clone, Default)]
+pub struct FetchOptionsBuilder {
+    headers: Option<std::collections::HashMap<String, String>>,
+    method: Option<String>,
+    post_data: Option<String>,
+    post_data_bytes: Option<Vec<u8>>,
+    url: Option<String>,
+    max_redirects: Option<u32>,
+    max_retries: Option<u32>,
+    timeout: Option<f64>,
+}
+
+impl FetchOptionsBuilder {
+    /// Sets the request headers
+    pub fn headers(mut self, headers: std::collections::HashMap<String, String>) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
+    /// Sets the request method
+    pub fn method(mut self, method: String) -> Self {
+        self.method = Some(method);
+        self
+    }
+
+    /// Sets the POST data as a string
+    pub fn post_data(mut self, post_data: String) -> Self {
+        self.post_data = Some(post_data);
+        self.post_data_bytes = None;
+        self
+    }
+
+    /// Sets the POST data as bytes
+    pub fn post_data_bytes(mut self, post_data_bytes: Vec<u8>) -> Self {
+        self.post_data_bytes = Some(post_data_bytes);
+        self.post_data = None;
+        self
+    }
+
+    /// Sets the request URL
+    pub fn url(mut self, url: String) -> Self {
+        self.url = Some(url);
+        self
+    }
+
+    /// Sets the maximum number of redirects to follow
+    pub fn max_redirects(mut self, n: u32) -> Self {
+        self.max_redirects = Some(n);
+        self
+    }
+
+    /// Sets the maximum number of retries
+    pub fn max_retries(mut self, n: u32) -> Self {
+        self.max_retries = Some(n);
+        self
+    }
+
+    /// Sets the request timeout in milliseconds
+    pub fn timeout(mut self, ms: f64) -> Self {
+        self.timeout = Some(ms);
+        self
+    }
+
+    /// Builds the FetchOptions
+    pub fn build(self) -> FetchOptions {
+        FetchOptions {
+            headers: self.headers,
+            method: self.method,
+            post_data: self.post_data,
+            post_data_bytes: self.post_data_bytes,
+            url: self.url,
+            max_redirects: self.max_redirects,
+            max_retries: self.max_retries,
+            timeout: self.timeout,
         }
     }
 }

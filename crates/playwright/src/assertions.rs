@@ -5,7 +5,8 @@
 // See: https://playwright.dev/docs/test-assertions
 
 use crate::error::Result;
-use crate::protocol::Locator;
+use crate::protocol::{Locator, Page};
+use std::path::Path;
 use std::time::Duration;
 
 /// Default timeout for assertions (5 seconds, matching Playwright)
@@ -62,7 +63,7 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///
 ///     // Test to_be_focused
 ///     page.goto("data:text/html,<input type='text' id='input'>", None).await?;
-///     page.evaluate("document.getElementById('input').focus()").await?;
+///     page.evaluate::<(), ()>("document.getElementById('input').focus()", None).await?;
 ///     expect(page.locator("#input").await).to_be_focused().await?;
 ///
 ///     // Test to_contain_text
@@ -656,6 +657,535 @@ impl Expectation {
             tokio::time::sleep(self.poll_interval).await;
         }
     }
+
+    /// Asserts that a locator's screenshot matches a baseline image.
+    ///
+    /// On first run (no baseline file), saves the screenshot as the new baseline.
+    /// On subsequent runs, compares the screenshot pixel-by-pixel against the baseline.
+    ///
+    /// See: <https://playwright.dev/docs/test-assertions#locator-assertions-to-have-screenshot-1>
+    pub async fn to_have_screenshot(
+        self,
+        baseline_path: impl AsRef<Path>,
+        options: Option<ScreenshotAssertionOptions>,
+    ) -> Result<()> {
+        let opts = options.unwrap_or_default();
+        let baseline_path = baseline_path.as_ref();
+
+        // Disable animations if requested
+        if opts.animations == Some(Animations::Disabled) {
+            let _ = self
+                .locator
+                .evaluate_js(DISABLE_ANIMATIONS_JS, None::<&()>)
+                .await;
+        }
+
+        // Build screenshot options with mask support
+        let screenshot_opts = if let Some(ref mask_locators) = opts.mask {
+            // Inject mask overlays before capturing
+            let mask_js = build_mask_js(mask_locators);
+            let _ = self.locator.evaluate_js(&mask_js, None::<&()>).await;
+            None
+        } else {
+            None
+        };
+
+        compare_screenshot(
+            &opts,
+            baseline_path,
+            self.timeout,
+            self.poll_interval,
+            self.negate,
+            || async { self.locator.screenshot(screenshot_opts.clone()).await },
+        )
+        .await
+    }
+}
+
+/// CSS to disable all animations and transitions
+const DISABLE_ANIMATIONS_JS: &str = r#"
+(() => {
+    const style = document.createElement('style');
+    style.textContent = '*, *::before, *::after { animation-duration: 0s !important; animation-delay: 0s !important; transition-duration: 0s !important; transition-delay: 0s !important; }';
+    style.setAttribute('data-playwright-no-animations', '');
+    document.head.appendChild(style);
+})()
+"#;
+
+/// Build JavaScript to overlay mask regions with pink (#FF00FF) rectangles
+fn build_mask_js(locators: &[Locator]) -> String {
+    let selectors: Vec<String> = locators
+        .iter()
+        .map(|l| {
+            let sel = l.selector().replace('\'', "\\'");
+            format!(
+                r#"
+                (function() {{
+                    var els = document.querySelectorAll('{}');
+                    els.forEach(function(el) {{
+                        var rect = el.getBoundingClientRect();
+                        var overlay = document.createElement('div');
+                        overlay.setAttribute('data-playwright-mask', '');
+                        overlay.style.cssText = 'position:fixed;z-index:2147483647;background:#FF00FF;pointer-events:none;'
+                            + 'left:' + rect.left + 'px;top:' + rect.top + 'px;width:' + rect.width + 'px;height:' + rect.height + 'px;';
+                        document.body.appendChild(overlay);
+                    }});
+                }})();
+                "#,
+                sel
+            )
+        })
+        .collect();
+    selectors.join("\n")
+}
+
+/// Animation control for screenshots
+///
+/// See: <https://playwright.dev/docs/api/class-locatorassertions#locator-assertions-to-have-screenshot-1>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Animations {
+    /// Allow animations to run normally
+    Allow,
+    /// Disable CSS animations and transitions before capturing
+    Disabled,
+}
+
+/// Options for screenshot assertions
+///
+/// See: <https://playwright.dev/docs/api/class-locatorassertions#locator-assertions-to-have-screenshot-1>
+#[derive(Debug, Clone, Default)]
+pub struct ScreenshotAssertionOptions {
+    /// Maximum number of different pixels allowed (default: 0)
+    pub max_diff_pixels: Option<u32>,
+    /// Maximum ratio of different pixels (0.0 to 1.0)
+    pub max_diff_pixel_ratio: Option<f64>,
+    /// Per-pixel color distance threshold (0.0 to 1.0, default: 0.2)
+    pub threshold: Option<f64>,
+    /// Disable CSS animations before capturing
+    pub animations: Option<Animations>,
+    /// Locators to mask with pink (#FF00FF) overlay
+    pub mask: Option<Vec<Locator>>,
+    /// Force update baseline even if it exists
+    pub update_snapshots: Option<bool>,
+}
+
+impl ScreenshotAssertionOptions {
+    /// Create a new builder for ScreenshotAssertionOptions
+    pub fn builder() -> ScreenshotAssertionOptionsBuilder {
+        ScreenshotAssertionOptionsBuilder::default()
+    }
+}
+
+/// Builder for ScreenshotAssertionOptions
+#[derive(Debug, Clone, Default)]
+pub struct ScreenshotAssertionOptionsBuilder {
+    max_diff_pixels: Option<u32>,
+    max_diff_pixel_ratio: Option<f64>,
+    threshold: Option<f64>,
+    animations: Option<Animations>,
+    mask: Option<Vec<Locator>>,
+    update_snapshots: Option<bool>,
+}
+
+impl ScreenshotAssertionOptionsBuilder {
+    /// Maximum number of different pixels allowed
+    pub fn max_diff_pixels(mut self, pixels: u32) -> Self {
+        self.max_diff_pixels = Some(pixels);
+        self
+    }
+
+    /// Maximum ratio of different pixels (0.0 to 1.0)
+    pub fn max_diff_pixel_ratio(mut self, ratio: f64) -> Self {
+        self.max_diff_pixel_ratio = Some(ratio);
+        self
+    }
+
+    /// Per-pixel color distance threshold (0.0 to 1.0)
+    pub fn threshold(mut self, threshold: f64) -> Self {
+        self.threshold = Some(threshold);
+        self
+    }
+
+    /// Disable CSS animations and transitions before capturing
+    pub fn animations(mut self, animations: Animations) -> Self {
+        self.animations = Some(animations);
+        self
+    }
+
+    /// Locators to mask with pink (#FF00FF) overlay
+    pub fn mask(mut self, locators: Vec<Locator>) -> Self {
+        self.mask = Some(locators);
+        self
+    }
+
+    /// Force update baseline even if it exists
+    pub fn update_snapshots(mut self, update: bool) -> Self {
+        self.update_snapshots = Some(update);
+        self
+    }
+
+    /// Build the ScreenshotAssertionOptions
+    pub fn build(self) -> ScreenshotAssertionOptions {
+        ScreenshotAssertionOptions {
+            max_diff_pixels: self.max_diff_pixels,
+            max_diff_pixel_ratio: self.max_diff_pixel_ratio,
+            threshold: self.threshold,
+            animations: self.animations,
+            mask: self.mask,
+            update_snapshots: self.update_snapshots,
+        }
+    }
+}
+
+/// Creates a page-level expectation for screenshot assertions.
+///
+/// See: <https://playwright.dev/docs/test-assertions#page-assertions-to-have-screenshot-1>
+pub fn expect_page(page: &Page) -> PageExpectation {
+    PageExpectation::new(page.clone())
+}
+
+/// Page-level expectation for screenshot assertions.
+#[allow(clippy::wrong_self_convention)]
+pub struct PageExpectation {
+    page: Page,
+    timeout: Duration,
+    poll_interval: Duration,
+    negate: bool,
+}
+
+impl PageExpectation {
+    fn new(page: Page) -> Self {
+        Self {
+            page,
+            timeout: DEFAULT_ASSERTION_TIMEOUT,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+            negate: false,
+        }
+    }
+
+    /// Sets a custom timeout for this assertion.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Negates the assertion.
+    #[allow(clippy::should_implement_trait)]
+    pub fn not(mut self) -> Self {
+        self.negate = true;
+        self
+    }
+
+    /// Asserts that the page screenshot matches a baseline image.
+    ///
+    /// See: <https://playwright.dev/docs/test-assertions#page-assertions-to-have-screenshot-1>
+    pub async fn to_have_screenshot(
+        self,
+        baseline_path: impl AsRef<Path>,
+        options: Option<ScreenshotAssertionOptions>,
+    ) -> Result<()> {
+        let opts = options.unwrap_or_default();
+        let baseline_path = baseline_path.as_ref();
+
+        // Disable animations if requested
+        if opts.animations == Some(Animations::Disabled) {
+            let _ = self.page.evaluate_expression(DISABLE_ANIMATIONS_JS).await;
+        }
+
+        // Inject mask overlays if specified
+        if let Some(ref mask_locators) = opts.mask {
+            let mask_js = build_mask_js(mask_locators);
+            let _ = self.page.evaluate_expression(&mask_js).await;
+        }
+
+        compare_screenshot(
+            &opts,
+            baseline_path,
+            self.timeout,
+            self.poll_interval,
+            self.negate,
+            || async { self.page.screenshot(None).await },
+        )
+        .await
+    }
+}
+
+/// Core screenshot comparison logic shared by Locator and Page assertions.
+async fn compare_screenshot<F, Fut>(
+    opts: &ScreenshotAssertionOptions,
+    baseline_path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
+    negate: bool,
+    take_screenshot: F,
+) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let threshold = opts.threshold.unwrap_or(0.2);
+    let max_diff_pixels = opts.max_diff_pixels;
+    let max_diff_pixel_ratio = opts.max_diff_pixel_ratio;
+    let update_snapshots = opts.update_snapshots.unwrap_or(false);
+
+    // Take initial screenshot
+    let actual_bytes = take_screenshot().await?;
+
+    // If baseline doesn't exist or update_snapshots is set, save and return
+    if !baseline_path.exists() || update_snapshots {
+        if let Some(parent) = baseline_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                crate::error::Error::ProtocolError(format!(
+                    "Failed to create baseline directory: {}",
+                    e
+                ))
+            })?;
+        }
+        tokio::fs::write(baseline_path, &actual_bytes)
+            .await
+            .map_err(|e| {
+                crate::error::Error::ProtocolError(format!(
+                    "Failed to write baseline screenshot: {}",
+                    e
+                ))
+            })?;
+        return Ok(());
+    }
+
+    // Load baseline
+    let baseline_bytes = tokio::fs::read(baseline_path).await.map_err(|e| {
+        crate::error::Error::ProtocolError(format!("Failed to read baseline screenshot: {}", e))
+    })?;
+
+    let start = std::time::Instant::now();
+
+    loop {
+        let screenshot_bytes = if start.elapsed().is_zero() {
+            actual_bytes.clone()
+        } else {
+            take_screenshot().await?
+        };
+
+        let comparison = compare_images(&baseline_bytes, &screenshot_bytes, threshold)?;
+
+        let within_tolerance =
+            is_within_tolerance(&comparison, max_diff_pixels, max_diff_pixel_ratio);
+
+        let matches = if negate {
+            !within_tolerance
+        } else {
+            within_tolerance
+        };
+
+        if matches {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            if negate {
+                return Err(crate::error::Error::AssertionTimeout(format!(
+                    "Expected screenshots NOT to match, but they matched after {:?}",
+                    timeout
+                )));
+            }
+
+            // Save actual and diff images for debugging
+            let baseline_stem = baseline_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("screenshot");
+            let baseline_ext = baseline_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("png");
+            let baseline_dir = baseline_path.parent().unwrap_or(Path::new("."));
+
+            let actual_path =
+                baseline_dir.join(format!("{}-actual.{}", baseline_stem, baseline_ext));
+            let diff_path = baseline_dir.join(format!("{}-diff.{}", baseline_stem, baseline_ext));
+
+            let _ = tokio::fs::write(&actual_path, &screenshot_bytes).await;
+
+            if let Ok(diff_bytes) =
+                generate_diff_image(&baseline_bytes, &screenshot_bytes, threshold)
+            {
+                let _ = tokio::fs::write(&diff_path, diff_bytes).await;
+            }
+
+            return Err(crate::error::Error::AssertionTimeout(format!(
+                "Screenshot mismatch: {} pixels differ ({:.2}% of total). \
+                 Max allowed: {}. Threshold: {:.2}. \
+                 Actual saved to: {}. Diff saved to: {}. \
+                 Timed out after {:?}",
+                comparison.diff_count,
+                comparison.diff_ratio * 100.0,
+                max_diff_pixels
+                    .map(|p| p.to_string())
+                    .or_else(|| max_diff_pixel_ratio.map(|r| format!("{:.2}%", r * 100.0)))
+                    .unwrap_or_else(|| "0".to_string()),
+                threshold,
+                actual_path.display(),
+                diff_path.display(),
+                timeout,
+            )));
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Result of comparing two images pixel-by-pixel
+struct ImageComparison {
+    diff_count: u32,
+    diff_ratio: f64,
+}
+
+fn is_within_tolerance(
+    comparison: &ImageComparison,
+    max_diff_pixels: Option<u32>,
+    max_diff_pixel_ratio: Option<f64>,
+) -> bool {
+    if let Some(max_pixels) = max_diff_pixels {
+        if comparison.diff_count > max_pixels {
+            return false;
+        }
+    } else if let Some(max_ratio) = max_diff_pixel_ratio {
+        if comparison.diff_ratio > max_ratio {
+            return false;
+        }
+    } else {
+        // No tolerance specified — require exact match
+        if comparison.diff_count > 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compare two PNG images pixel-by-pixel with a color distance threshold
+fn compare_images(
+    baseline_bytes: &[u8],
+    actual_bytes: &[u8],
+    threshold: f64,
+) -> Result<ImageComparison> {
+    use image::GenericImageView;
+
+    let baseline_img = image::load_from_memory(baseline_bytes).map_err(|e| {
+        crate::error::Error::ProtocolError(format!("Failed to decode baseline image: {}", e))
+    })?;
+    let actual_img = image::load_from_memory(actual_bytes).map_err(|e| {
+        crate::error::Error::ProtocolError(format!("Failed to decode actual image: {}", e))
+    })?;
+
+    let (bw, bh) = baseline_img.dimensions();
+    let (aw, ah) = actual_img.dimensions();
+
+    // Different dimensions = all pixels differ
+    if bw != aw || bh != ah {
+        let total = bw.max(aw) * bh.max(ah);
+        return Ok(ImageComparison {
+            diff_count: total,
+            diff_ratio: 1.0,
+        });
+    }
+
+    let total_pixels = bw * bh;
+    if total_pixels == 0 {
+        return Ok(ImageComparison {
+            diff_count: 0,
+            diff_ratio: 0.0,
+        });
+    }
+
+    let threshold_sq = threshold * threshold;
+    let mut diff_count: u32 = 0;
+
+    for y in 0..bh {
+        for x in 0..bw {
+            let bp = baseline_img.get_pixel(x, y);
+            let ap = actual_img.get_pixel(x, y);
+
+            // Compute normalized color distance (each channel 0.0-1.0)
+            let dr = (bp[0] as f64 - ap[0] as f64) / 255.0;
+            let dg = (bp[1] as f64 - ap[1] as f64) / 255.0;
+            let db = (bp[2] as f64 - ap[2] as f64) / 255.0;
+            let da = (bp[3] as f64 - ap[3] as f64) / 255.0;
+
+            let dist_sq = (dr * dr + dg * dg + db * db + da * da) / 4.0;
+
+            if dist_sq > threshold_sq {
+                diff_count += 1;
+            }
+        }
+    }
+
+    Ok(ImageComparison {
+        diff_count,
+        diff_ratio: diff_count as f64 / total_pixels as f64,
+    })
+}
+
+/// Generate a diff image highlighting differences in red
+fn generate_diff_image(
+    baseline_bytes: &[u8],
+    actual_bytes: &[u8],
+    threshold: f64,
+) -> Result<Vec<u8>> {
+    use image::{GenericImageView, ImageBuffer, Rgba};
+
+    let baseline_img = image::load_from_memory(baseline_bytes).map_err(|e| {
+        crate::error::Error::ProtocolError(format!("Failed to decode baseline image: {}", e))
+    })?;
+    let actual_img = image::load_from_memory(actual_bytes).map_err(|e| {
+        crate::error::Error::ProtocolError(format!("Failed to decode actual image: {}", e))
+    })?;
+
+    let (bw, bh) = baseline_img.dimensions();
+    let (aw, ah) = actual_img.dimensions();
+    let width = bw.max(aw);
+    let height = bh.max(ah);
+
+    let threshold_sq = threshold * threshold;
+
+    let mut diff_img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(width, height);
+
+    for y in 0..height {
+        for x in 0..width {
+            if x >= bw || y >= bh || x >= aw || y >= ah {
+                // Out of bounds for one image — mark as diff
+                diff_img.put_pixel(x, y, Rgba([255, 0, 0, 255]));
+                continue;
+            }
+
+            let bp = baseline_img.get_pixel(x, y);
+            let ap = actual_img.get_pixel(x, y);
+
+            let dr = (bp[0] as f64 - ap[0] as f64) / 255.0;
+            let dg = (bp[1] as f64 - ap[1] as f64) / 255.0;
+            let db = (bp[2] as f64 - ap[2] as f64) / 255.0;
+            let da = (bp[3] as f64 - ap[3] as f64) / 255.0;
+
+            let dist_sq = (dr * dr + dg * dg + db * db + da * da) / 4.0;
+
+            if dist_sq > threshold_sq {
+                // Different — red highlight
+                diff_img.put_pixel(x, y, Rgba([255, 0, 0, 255]));
+            } else {
+                // Same — semi-transparent grayscale of actual
+                let gray = ((ap[0] as u16 + ap[1] as u16 + ap[2] as u16) / 3) as u8;
+                diff_img.put_pixel(x, y, Rgba([gray, gray, gray, 100]));
+            }
+        }
+    }
+
+    let mut output = std::io::Cursor::new(Vec::new());
+    diff_img
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(|e| {
+            crate::error::Error::ProtocolError(format!("Failed to encode diff image: {}", e))
+        })?;
+
+    Ok(output.into_inner())
 }
 
 #[cfg(test)]

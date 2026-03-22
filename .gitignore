@@ -23,4 +23,7 @@ Thumbs.db
 .env.local
 
 # Documentation
-*gap-analysis.md
+
+# cargo-mutants
+mutants.out/
+mutants.out.old/

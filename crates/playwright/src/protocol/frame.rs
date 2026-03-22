@@ -4,13 +4,14 @@
 // Navigation and DOM operations happen on frames, not directly on pages.
 
 use crate::error::{Error, Result};
-use crate::protocol::page::{GotoOptions, Response};
+use crate::protocol::page::{GotoOptions, Response, WaitUntil};
+use crate::protocol::{parse_result, serialize_argument, serialize_null};
 use crate::server::channel::Channel;
 use crate::server::channel_owner::{ChannelOwner, ChannelOwnerImpl, ParentOrConnection};
 use serde::Deserialize;
 use serde_json::Value;
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Frame represents a frame within a page.
 ///
@@ -23,6 +24,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct Frame {
     base: ChannelOwnerImpl,
+    /// Current URL of the frame
+    /// Wrapped in RwLock to allow updates from events
+    url: Arc<RwLock<String>>,
 }
 
 impl Frame {
@@ -40,15 +44,33 @@ impl Frame {
             ParentOrConnection::Parent(parent),
             type_name,
             guid,
-            initializer,
+            initializer.clone(),
         );
 
-        Ok(Self { base })
+        // Extract initial URL from initializer if available
+        let initial_url = initializer
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("about:blank")
+            .to_string();
+
+        let url = Arc::new(RwLock::new(initial_url));
+
+        Ok(Self { base, url })
     }
 
     /// Returns the channel for sending protocol messages
     fn channel(&self) -> &Channel {
         self.base.channel()
+    }
+
+    /// Returns the current URL of the frame.
+    ///
+    /// This returns the last committed URL. Initially, frames are at "about:blank".
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-url>
+    pub fn url(&self) -> String {
+        self.url.read().unwrap().clone()
     }
 
     /// Navigates the frame to the specified URL.
@@ -176,6 +198,165 @@ impl Frame {
 
         let response: TitleResponse = self.channel().send("title", serde_json::json!({})).await?;
         Ok(response.value)
+    }
+
+    /// Returns the full HTML content of the frame, including the DOCTYPE.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-content>
+    pub async fn content(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct ContentResponse {
+            value: String,
+        }
+
+        let response: ContentResponse = self
+            .channel()
+            .send("content", serde_json::json!({}))
+            .await?;
+        Ok(response.value)
+    }
+
+    /// Sets the content of the frame.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-set-content>
+    pub async fn set_content(&self, html: &str, options: Option<GotoOptions>) -> Result<()> {
+        let mut params = serde_json::json!({
+            "html": html,
+        });
+
+        if let Some(opts) = options {
+            if let Some(timeout) = opts.timeout {
+                params["timeout"] = serde_json::json!(timeout.as_millis() as u64);
+            } else {
+                params["timeout"] = serde_json::json!(crate::DEFAULT_TIMEOUT_MS);
+            }
+            if let Some(wait_until) = opts.wait_until {
+                params["waitUntil"] = serde_json::json!(wait_until.as_str());
+            }
+        } else {
+            params["timeout"] = serde_json::json!(crate::DEFAULT_TIMEOUT_MS);
+        }
+
+        self.channel().send_no_result("setContent", params).await
+    }
+
+    /// Waits for the required load state to be reached.
+    ///
+    /// Playwright's protocol doesn't expose `waitForLoadState` as a server-side command —
+    /// it's implemented client-side using lifecycle events. We implement it by polling
+    /// `document.readyState` via JavaScript evaluation.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-wait-for-load-state>
+    pub async fn wait_for_load_state(&self, state: Option<WaitUntil>) -> Result<()> {
+        let target_state = state.unwrap_or(WaitUntil::Load);
+
+        let js_check = match target_state {
+            // "load" means the full page has loaded (readyState === "complete")
+            WaitUntil::Load => "document.readyState === 'complete'",
+            // "domcontentloaded" means DOM is ready (readyState !== "loading")
+            WaitUntil::DomContentLoaded => "document.readyState !== 'loading'",
+            // "networkidle" has no direct readyState equivalent; we approximate
+            // by checking "complete" (same as Load)
+            WaitUntil::NetworkIdle => "document.readyState === 'complete'",
+            // "commit" means any response has been received (readyState !== "loading" at minimum)
+            WaitUntil::Commit => "document.readyState !== 'loading'",
+        };
+
+        let timeout_ms = crate::DEFAULT_TIMEOUT_MS as u64;
+        let poll_interval = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+
+        loop {
+            #[derive(Deserialize)]
+            struct EvalResponse {
+                value: serde_json::Value,
+            }
+
+            let result: EvalResponse = self
+                .channel()
+                .send(
+                    "evaluateExpression",
+                    serde_json::json!({
+                        "expression": js_check,
+                        "isFunction": false,
+                        "arg": crate::protocol::serialize_null(),
+                    }),
+                )
+                .await?;
+
+            // Playwright protocol returns booleans as {"b": true/false}
+            let is_ready = result
+                .value
+                .as_object()
+                .and_then(|m| m.get("b"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if is_ready {
+                return Ok(());
+            }
+
+            if start.elapsed().as_millis() as u64 >= timeout_ms {
+                return Err(crate::error::Error::Timeout(format!(
+                    "wait_for_load_state({}) timed out after {}ms",
+                    target_state.as_str(),
+                    timeout_ms
+                )));
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Waits for the frame to navigate to a URL matching the given string or glob pattern.
+    ///
+    /// Playwright's protocol doesn't expose `waitForURL` as a server-side command —
+    /// it's implemented client-side. We implement it by polling `window.location.href`.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-wait-for-url>
+    pub async fn wait_for_url(&self, url: &str, options: Option<GotoOptions>) -> Result<()> {
+        let timeout_ms = options
+            .as_ref()
+            .and_then(|o| o.timeout)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(crate::DEFAULT_TIMEOUT_MS as u64);
+
+        // Convert glob pattern to regex for matching
+        // Playwright supports string (exact), glob (**), and regex patterns
+        // We support exact string and basic glob patterns
+        let is_glob = url.contains('*');
+
+        let poll_interval = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+
+        loop {
+            let current_url = self.url();
+
+            let matches = if is_glob {
+                glob_match(url, &current_url)
+            } else {
+                current_url == url
+            };
+
+            if matches {
+                // URL matches — optionally wait for load state
+                if let Some(ref opts) = options {
+                    if let Some(wait_until) = opts.wait_until {
+                        self.wait_for_load_state(Some(wait_until)).await?;
+                    }
+                }
+                return Ok(());
+            }
+
+            if start.elapsed().as_millis() as u64 >= timeout_ms {
+                return Err(crate::error::Error::Timeout(format!(
+                    "wait_for_url({}) timed out after {}ms, current URL: {}",
+                    url, timeout_ms, current_url
+                )));
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Returns the first element matching the selector, or None if not found.
@@ -493,6 +674,50 @@ impl Frame {
         Ok(response.value)
     }
 
+    /// Returns whether the element is hidden.
+    pub(crate) async fn locator_is_hidden(&self, selector: &str) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct IsHiddenResponse {
+            value: bool,
+        }
+
+        let response: IsHiddenResponse = self
+            .channel()
+            .send(
+                "isHidden",
+                serde_json::json!({
+                    "selector": selector,
+                    "strict": true,
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await?;
+
+        Ok(response.value)
+    }
+
+    /// Returns whether the element is disabled.
+    pub(crate) async fn locator_is_disabled(&self, selector: &str) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct IsDisabledResponse {
+            value: bool,
+        }
+
+        let response: IsDisabledResponse = self
+            .channel()
+            .send(
+                "isDisabled",
+                serde_json::json!({
+                    "selector": selector,
+                    "strict": true,
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await?;
+
+        Ok(response.value)
+    }
+
     /// Returns whether the element is focused (currently has focus).
     ///
     /// This implementation checks if the element is the activeElement in the DOM
@@ -674,6 +899,142 @@ impl Frame {
         self.channel().send_no_result("press", params).await
     }
 
+    /// Sets focus on the element matching the selector.
+    pub(crate) async fn locator_focus(&self, selector: &str) -> Result<()> {
+        self.channel()
+            .send_no_result(
+                "focus",
+                serde_json::json!({
+                    "selector": selector,
+                    "strict": true,
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await
+    }
+
+    /// Removes focus from the element matching the selector.
+    pub(crate) async fn locator_blur(&self, selector: &str) -> Result<()> {
+        self.channel()
+            .send_no_result(
+                "blur",
+                serde_json::json!({
+                    "selector": selector,
+                    "strict": true,
+                    "timeout": crate::DEFAULT_TIMEOUT_MS
+                }),
+            )
+            .await
+    }
+
+    /// Types text into the element character by character.
+    ///
+    /// Uses the Playwright protocol `"type"` message (the legacy name for pressSequentially).
+    pub(crate) async fn locator_press_sequentially(
+        &self,
+        selector: &str,
+        text: &str,
+        options: Option<crate::protocol::PressSequentiallyOptions>,
+    ) -> Result<()> {
+        let mut params = serde_json::json!({
+            "selector": selector,
+            "text": text,
+            "strict": true
+        });
+
+        if let Some(opts) = options {
+            let opts_json = opts.to_json();
+            if let Some(obj) = params.as_object_mut() {
+                if let Some(opts_obj) = opts_json.as_object() {
+                    obj.extend(opts_obj.clone());
+                }
+            }
+        } else {
+            params["timeout"] = serde_json::json!(crate::DEFAULT_TIMEOUT_MS);
+        }
+
+        self.channel().send_no_result("type", params).await
+    }
+
+    /// Returns the inner text of all elements matching the selector.
+    pub(crate) async fn locator_all_inner_texts(&self, selector: &str) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct EvaluateResult {
+            value: serde_json::Value,
+        }
+
+        // The Playwright protocol's evalOnSelectorAll requires an `arg` field.
+        // We pass a null argument since our expression doesn't use one.
+        let params = serde_json::json!({
+            "selector": selector,
+            "expression": "ee => ee.map(e => e.innerText)",
+            "isFunction": true,
+            "arg": {
+                "value": {"v": "null"},
+                "handles": []
+            }
+        });
+
+        let result: EvaluateResult = self.channel().send("evalOnSelectorAll", params).await?;
+
+        Self::parse_string_array(result.value)
+    }
+
+    /// Returns the text content of all elements matching the selector.
+    pub(crate) async fn locator_all_text_contents(&self, selector: &str) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct EvaluateResult {
+            value: serde_json::Value,
+        }
+
+        // The Playwright protocol's evalOnSelectorAll requires an `arg` field.
+        // We pass a null argument since our expression doesn't use one.
+        let params = serde_json::json!({
+            "selector": selector,
+            "expression": "ee => ee.map(e => e.textContent || '')",
+            "isFunction": true,
+            "arg": {
+                "value": {"v": "null"},
+                "handles": []
+            }
+        });
+
+        let result: EvaluateResult = self.channel().send("evalOnSelectorAll", params).await?;
+
+        Self::parse_string_array(result.value)
+    }
+
+    /// Parses a Playwright protocol array value into a Vec<String>.
+    ///
+    /// The Playwright protocol returns arrays as:
+    /// `{"a": [{"s": "value1"}, {"s": "value2"}, ...]}`
+    fn parse_string_array(value: serde_json::Value) -> Result<Vec<String>> {
+        // Playwright protocol wraps arrays in {"a": [...]}
+        let array = if let Some(arr) = value.get("a").and_then(|v| v.as_array()) {
+            arr.clone()
+        } else if let Some(arr) = value.as_array() {
+            arr.clone()
+        } else {
+            return Ok(Vec::new());
+        };
+
+        let mut result = Vec::with_capacity(array.len());
+        for item in &array {
+            // Each string item is wrapped as {"s": "value"} in Playwright protocol
+            let s = if let Some(s) = item.get("s").and_then(|v| v.as_str()) {
+                s.to_string()
+            } else if let Some(s) = item.as_str() {
+                s.to_string()
+            } else if item.is_null() {
+                String::new()
+            } else {
+                item.to_string()
+            };
+            result.push(s);
+        }
+        Ok(result)
+    }
+
     pub(crate) async fn locator_check(
         &self,
         selector: &str,
@@ -842,7 +1203,7 @@ impl Frame {
         selector: &str,
         file: &std::path::PathBuf,
     ) -> Result<()> {
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         use std::io::Read;
 
         // Read file contents
@@ -880,7 +1241,7 @@ impl Frame {
         selector: &str,
         files: &[&std::path::PathBuf],
     ) -> Result<()> {
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         use std::io::Read;
 
         // If empty array, clear the files
@@ -938,7 +1299,7 @@ impl Frame {
         selector: &str,
         file: crate::protocol::FilePayload,
     ) -> Result<()> {
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
 
         // Base64 encode the file contents
         let base64_content = general_purpose::STANDARD.encode(&file.buffer);
@@ -965,7 +1326,7 @@ impl Frame {
         selector: &str,
         files: &[crate::protocol::FilePayload],
     ) -> Result<()> {
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
 
         // If empty array, clear the files
         if files.is_empty() {
@@ -1083,6 +1444,296 @@ impl Frame {
             }
         }
     }
+
+    /// Evaluates a JavaScript expression in the frame context with optional arguments.
+    ///
+    /// Executes the provided JavaScript expression within the frame's context and returns
+    /// the result. The return value must be JSON-serializable.
+    ///
+    /// # Arguments
+    ///
+    /// * `expression` - JavaScript code to evaluate
+    /// * `arg` - Optional argument to pass to the expression (must implement Serialize)
+    ///
+    /// # Returns
+    ///
+    /// The result as a `serde_json::Value`
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use serde_json::json;
+    /// use playwright_rs::protocol::Playwright;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let playwright = Playwright::launch().await?;
+    ///     let browser = playwright.chromium().launch().await?;
+    ///     let page = browser.new_page().await?;
+    ///     let frame = page.main_frame().await?;
+    ///
+    ///     // Evaluate without arguments
+    ///     let result = frame.evaluate::<()>("1 + 1", None).await?;
+    ///
+    ///     // Evaluate with argument
+    ///     let arg = json!({"x": 5, "y": 3});
+    ///     let result = frame.evaluate::<serde_json::Value>("(arg) => arg.x + arg.y", Some(&arg)).await?;
+    ///     assert_eq!(result, json!(8));
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-evaluate>
+    pub async fn evaluate<T: serde::Serialize>(
+        &self,
+        expression: &str,
+        arg: Option<&T>,
+    ) -> Result<Value> {
+        // Serialize the argument
+        let serialized_arg = match arg {
+            Some(a) => serialize_argument(a),
+            None => serialize_null(),
+        };
+
+        // Build the parameters
+        let params = serde_json::json!({
+            "expression": expression,
+            "arg": serialized_arg
+        });
+
+        // Send the evaluateExpression command
+        #[derive(Deserialize)]
+        struct EvaluateResult {
+            value: serde_json::Value,
+        }
+
+        let result: EvaluateResult = self.channel().send("evaluateExpression", params).await?;
+
+        // Deserialize the result using parse_result
+        Ok(parse_result(&result.value))
+    }
+
+    /// Adds a `<style>` tag into the page with the desired content.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Style tag options (content, url, or path)
+    ///
+    /// At least one of `content`, `url`, or `path` must be specified.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use playwright_rs::protocol::{Playwright, AddStyleTagOptions};
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let playwright = Playwright::launch().await?;
+    /// # let browser = playwright.chromium().launch().await?;
+    /// # let context = browser.new_context().await?;
+    /// # let page = context.new_page().await?;
+    /// # let frame = page.main_frame().await?;
+    /// use playwright_rs::protocol::AddStyleTagOptions;
+    ///
+    /// // With inline CSS
+    /// frame.add_style_tag(
+    ///     AddStyleTagOptions::builder()
+    ///         .content("body { background-color: red; }")
+    ///         .build()
+    /// ).await?;
+    ///
+    /// // With URL
+    /// frame.add_style_tag(
+    ///     AddStyleTagOptions::builder()
+    ///         .url("https://example.com/style.css")
+    ///         .build()
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-add-style-tag>
+    pub async fn add_style_tag(
+        &self,
+        options: crate::protocol::page::AddStyleTagOptions,
+    ) -> Result<Arc<crate::protocol::ElementHandle>> {
+        // Validate that at least one option is provided
+        options.validate()?;
+
+        // Build protocol parameters
+        let mut params = serde_json::json!({});
+
+        if let Some(content) = &options.content {
+            params["content"] = serde_json::json!(content);
+        }
+
+        if let Some(url) = &options.url {
+            params["url"] = serde_json::json!(url);
+        }
+
+        if let Some(path) = &options.path {
+            // Read file content and send as content
+            let css_content = tokio::fs::read_to_string(path).await.map_err(|e| {
+                Error::InvalidArgument(format!("Failed to read CSS file '{}': {}", path, e))
+            })?;
+            params["content"] = serde_json::json!(css_content);
+        }
+
+        #[derive(Deserialize)]
+        struct AddStyleTagResponse {
+            element: serde_json::Value,
+        }
+
+        let response: AddStyleTagResponse = self.channel().send("addStyleTag", params).await?;
+
+        let guid = response.element["guid"].as_str().ok_or_else(|| {
+            Error::ProtocolError("Element GUID missing in addStyleTag response".to_string())
+        })?;
+
+        let connection = self.base.connection();
+        let element = connection.get_object(guid).await?;
+
+        let handle = element
+            .as_any()
+            .downcast_ref::<crate::protocol::ElementHandle>()
+            .map(|e| Arc::new(e.clone()))
+            .ok_or_else(|| {
+                Error::ProtocolError(format!("Object {} is not an ElementHandle", guid))
+            })?;
+
+        Ok(handle)
+    }
+
+    /// Dispatches a DOM event on the element matching the selector.
+    ///
+    /// Unlike clicking or typing, `dispatch_event` directly sends the event without
+    /// performing any actionability checks. It still waits for the element to be present
+    /// in the DOM.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-dispatch-event>
+    pub(crate) async fn locator_dispatch_event(
+        &self,
+        selector: &str,
+        type_: &str,
+        event_init: Option<serde_json::Value>,
+    ) -> Result<()> {
+        // Serialize eventInit using Playwright's protocol argument format.
+        // If None, use {"value": {"v": "undefined"}, "handles": []}.
+        let event_init_serialized = match event_init {
+            Some(v) => serialize_argument(&v),
+            None => serde_json::json!({"value": {"v": "undefined"}, "handles": []}),
+        };
+
+        let params = serde_json::json!({
+            "selector": selector,
+            "type": type_,
+            "eventInit": event_init_serialized,
+            "strict": true,
+            "timeout": crate::DEFAULT_TIMEOUT_MS
+        });
+
+        self.channel().send_no_result("dispatchEvent", params).await
+    }
+
+    /// Returns the bounding box of the element matching the selector, or None if not visible.
+    ///
+    /// The bounding box is returned in pixels. If the element is not visible (e.g.,
+    /// `display: none`), returns `None`.
+    ///
+    /// Implemented via ElementHandle because `boundingBox` is an ElementHandle-level
+    /// protocol method, not a Frame-level method.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-bounding-box>
+    pub(crate) async fn locator_bounding_box(
+        &self,
+        selector: &str,
+    ) -> Result<Option<crate::protocol::locator::BoundingBox>> {
+        let element = self.query_selector(selector).await?;
+        match element {
+            Some(handle) => handle.bounding_box().await,
+            None => Ok(None),
+        }
+    }
+
+    /// Scrolls the element into view if it is not already visible in the viewport.
+    ///
+    /// Implemented via ElementHandle because `scrollIntoViewIfNeeded` is an
+    /// ElementHandle-level protocol method, not a Frame-level method.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-locator#locator-scroll-into-view-if-needed>
+    pub(crate) async fn locator_scroll_into_view_if_needed(&self, selector: &str) -> Result<()> {
+        let element = self.query_selector(selector).await?;
+        match element {
+            Some(handle) => handle.scroll_into_view_if_needed().await,
+            None => Err(crate::error::Error::ElementNotFound(format!(
+                "Element not found: {}",
+                selector
+            ))),
+        }
+    }
+
+    /// Adds a `<script>` tag into the frame with the desired content.
+    ///
+    /// # Arguments
+    ///
+    /// * `options` - Script tag options (content, url, or path)
+    ///
+    /// At least one of `content`, `url`, or `path` must be specified.
+    ///
+    /// See: <https://playwright.dev/docs/api/class-frame#frame-add-script-tag>
+    pub async fn add_script_tag(
+        &self,
+        options: crate::protocol::page::AddScriptTagOptions,
+    ) -> Result<Arc<crate::protocol::ElementHandle>> {
+        // Validate that at least one option is provided
+        options.validate()?;
+
+        // Build protocol parameters
+        let mut params = serde_json::json!({});
+
+        if let Some(content) = &options.content {
+            params["content"] = serde_json::json!(content);
+        }
+
+        if let Some(url) = &options.url {
+            params["url"] = serde_json::json!(url);
+        }
+
+        if let Some(path) = &options.path {
+            // Read file content and send as content
+            let js_content = tokio::fs::read_to_string(path).await.map_err(|e| {
+                Error::InvalidArgument(format!("Failed to read JS file '{}': {}", path, e))
+            })?;
+            params["content"] = serde_json::json!(js_content);
+        }
+
+        if let Some(type_) = &options.type_ {
+            params["type"] = serde_json::json!(type_);
+        }
+
+        #[derive(Deserialize)]
+        struct AddScriptTagResponse {
+            element: serde_json::Value,
+        }
+
+        let response: AddScriptTagResponse = self.channel().send("addScriptTag", params).await?;
+
+        let guid = response.element["guid"].as_str().ok_or_else(|| {
+            Error::ProtocolError("Element GUID missing in addScriptTag response".to_string())
+        })?;
+
+        let connection = self.base.connection();
+        let element = connection.get_object(guid).await?;
+
+        let handle = element
+            .as_any()
+            .downcast_ref::<crate::protocol::ElementHandle>()
+            .map(|e| Arc::new(e.clone()))
+            .ok_or_else(|| {
+                Error::ProtocolError(format!("Object {} is not an ElementHandle", guid))
+            })?;
+
+        Ok(handle)
+    }
 }
 
 impl ChannelOwner for Frame {
@@ -1126,9 +1777,24 @@ impl ChannelOwner for Frame {
         self.base.remove_child(guid)
     }
 
-    fn on_event(&self, _method: &str, _params: Value) {
-        // TODO: Handle frame events in future phases
-        // Events: loadstate, navigated, etc.
+    fn on_event(&self, method: &str, params: Value) {
+        match method {
+            "navigated" => {
+                // Update frame's URL when navigation occurs (including hash changes)
+                if let Some(url_value) = params.get("url") {
+                    if let Some(url_str) = url_value.as_str() {
+                        // Update frame's URL
+                        if let Ok(mut url) = self.url.write() {
+                            *url = url_str.to_string();
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Other events will be handled in future phases
+                // Events: loadstate, etc.
+            }
+        }
     }
 
     fn was_collected(&self) -> bool {
@@ -1144,4 +1810,20 @@ impl std::fmt::Debug for Frame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Frame").field("guid", &self.guid()).finish()
     }
+}
+
+/// Simple glob pattern matching for URL patterns.
+///
+/// Supports `*` (matches any characters except `/`) and `**` (matches any characters including `/`).
+/// This matches Playwright's URL glob pattern behavior.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let regex_str = pattern
+        .replace('.', "\\.")
+        .replace("**", "\x00") // placeholder for **
+        .replace('*', "[^/]*")
+        .replace('\x00', ".*"); // restore ** as .*
+    let regex_str = format!("^{}$", regex_str);
+    regex::Regex::new(&regex_str)
+        .map(|re| re.is_match(text))
+        .unwrap_or(false)
 }

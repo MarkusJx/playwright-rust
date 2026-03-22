@@ -63,17 +63,50 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-playwright-rs = "0.7.0"
+playwright-rs = "0.8"  # Auto-updates to latest 0.8.x
 tokio = { version = "1", features = ["full"] }
 ```
 
 See the [CHANGELOG](CHANGELOG.md) for version history and features.
 
+### Browser Installation (Required)
+
+**Important:** Browsers must be installed separately using the Playwright CLI.
+
+The library bundles Playwright driver version **1.56.1**. You must install matching browser versions:
+
+```bash
+# Install all browsers (recommended)
+npx playwright@1.56.1 install
+
+# Or install specific browsers
+npx playwright@1.56.1 install chromium firefox webkit
+```
+
+**Why version matters:** Each Playwright release expects specific browser builds. Using `playwright@1.56.1` ensures you get compatible browsers (chromium-1194, firefox-1495, webkit-2215).
+
+**In CI/CD:** Add this to your GitHub Actions workflow:
+
+```yaml
+- name: Install Playwright Browsers
+  run: npx playwright@1.56.1 install chromium firefox webkit --with-deps
+```
+
+The version constant is also available in code:
+
+```rust
+use playwright_rs::PLAYWRIGHT_VERSION;
+
+println!("Install with: npx playwright@{} install", PLAYWRIGHT_VERSION);
+```
+
+**What happens if I don't install browsers?** You'll get a helpful error message with the correct install command when trying to launch a browser.
+
 ## Development
 
 ### Prerequisites
 
-- Rust 1.70+
+- Rust 1.85+
 - Node.js 18+ (for Playwright server and browser installation)
 - tokio async runtime
 
@@ -94,65 +127,16 @@ cargo build
 
 ### Installing Browsers
 
-**⚠️ IMPORTANT:** Browsers are installed **automatically** after building the project!
-
-When you run `cargo build`, the build script ([build.rs](crates/playwright/build.rs)) automatically:
-1. Downloads the Playwright driver (version **1.56.1**) from Azure CDN
-2. Extracts it to the appropriate location based on your setup:
-   - **Workspace projects**: `drivers/playwright-1.56.1-<platform>/` in your workspace root
-   - **Non-workspace projects**: Platform-specific cache directory (e.g., `~/.cache/playwright-rust/drivers/` on Linux/macOS)
-
-The build script uses robust workspace detection to find the right location automatically.
-
-After building, install browsers using the downloaded driver's CLI:
+After building, install browsers as described in [Browser Installation](#browser-installation-required) above:
 
 ```bash
-# Build the project (downloads Playwright 1.56.1 driver)
 cargo build
-
-# Install browsers using the driver's CLI
-# macOS/Linux:
-drivers/playwright-1.56.1-*/node drivers/playwright-1.56.1-*/package/cli.js install chromium firefox webkit
-
-# Windows:
-drivers\playwright-1.56.1-win32_x64\node.exe drivers\playwright-1.56.1-win32_x64\package\cli.js install chromium firefox webkit
+npx playwright@1.56.1 install chromium firefox webkit
 ```
 
-**Platform-specific examples:**
+The build script automatically downloads the Playwright driver to `drivers/` (gitignored). CI handles browser installation automatically - see `.github/workflows/test.yml`.
 
-```bash
-# macOS (arm64):
-drivers/playwright-1.56.1-mac-arm64/node drivers/playwright-1.56.1-mac-arm64/package/cli.js install chromium firefox webkit
-
-# macOS (x64):
-drivers/playwright-1.56.1-mac/node drivers/playwright-1.56.1-mac/package/cli.js install chromium firefox webkit
-
-# Linux:
-drivers/playwright-1.56.1-linux/node drivers/playwright-1.56.1-linux/package/cli.js install chromium firefox webkit
-```
-
-**Why this matters:**
-- Playwright server 1.56.1 expects specific browser builds (chromium-1194, firefox-1495, webkit-2215)
-- Using the driver's CLI ensures version compatibility
-- The `drivers/` directory is gitignored, so each developer/CI environment installs its own
-
-**Platform Support:**
-- ✅ **Windows**: Full support with CI stability flags enabled (2025-11-09)
-- ✅ **macOS**: Full support
-- ✅ **Linux**: Full support
-
-**Note:** CI automatically installs the correct browser versions - see `.github/workflows/test.yml`
-
-**Verify installation:**
-```bash
-# Browsers are cached in:
-# macOS: ~/Library/Caches/ms-playwright/
-# Linux: ~/.cache/ms-playwright/
-# Windows: %USERPROFILE%\AppData\Local\ms-playwright\
-
-ls ~/Library/Caches/ms-playwright/
-# Should show: chromium-1194, chromium_headless_shell-1194, firefox-1495, webkit-2215
-```
+**Platform Support:** ✅ Windows, macOS, Linux
 
 ### Running Tests
 
@@ -178,11 +162,16 @@ cargo nextest run test_launch_chromium
 RUST_LOG=debug cargo nextest run
 
 # Doc-tests (nextest doesn't run these)
-# Compile-only check (fast, used in pre-commit)
-cargo test --doc --no-fail-fast
+# See CLAUDE.md "Documentation Testing Strategy" for details
 
-# Run ignored doctests (requires browsers, what CI does)
-cargo test --doc -- --ignored
+# Compile-only check (fast, used in pre-commit)
+cargo test --doc --workspace
+
+# Execute all ignored doctests (requires browsers, what CI does)
+cargo test --doc --workspace -- --ignored
+
+# Execute specific crate's doctests
+cargo test --doc -p playwright-rs -- --ignored
 ```
 
 ### Running Examples

@@ -1,4 +1,4 @@
-// Copyright 2024 Paul Adamson
+// Copyright 2026 Paul Adamson
 // Licensed under the Apache License, Version 2.0
 //
 // Dialog protocol object
@@ -8,7 +8,7 @@
 
 use crate::error::Result;
 use crate::server::channel_owner::{ChannelOwner, ChannelOwnerImpl, ParentOrConnection};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::any::Any;
 use std::sync::Arc;
 

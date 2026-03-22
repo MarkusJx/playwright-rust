@@ -1,4 +1,4 @@
-// Copyright 2024 Paul Adamson
+// Copyright 2026 Paul Adamson
 // Licensed under the Apache License, Version 2.0
 //
 // Channel - RPC communication proxy for ChannelOwner objects
@@ -13,8 +13,8 @@
 
 use crate::error::Result;
 use crate::server::connection::ConnectionLike;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -149,6 +149,17 @@ impl Channel {
     pub async fn send_no_result<P: Serialize>(&self, method: &str, params: P) -> Result<()> {
         let _: Value = self.send(method, params).await?;
         Ok(())
+    }
+
+    pub async fn update_subscription(&self, event: &str, enabled: bool) -> Result<()> {
+        self.send_no_result(
+            "updateSubscription",
+            serde_json::json!({
+                "event": event,
+                "enabled": enabled,
+            }),
+        )
+        .await
     }
 
     /// Returns the GUID this channel represents.

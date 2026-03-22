@@ -159,6 +159,18 @@ mod assertions;
 mod error;
 pub mod protocol;
 
+/// Playwright server version bundled with this crate.
+///
+/// This version determines which browser builds are compatible.
+/// When installing browsers, use this version to ensure compatibility:
+///
+/// ```bash
+/// npx playwright@1.56.1 install
+/// ```
+///
+/// See: <https://playwright.dev/docs/browsers>
+pub const PLAYWRIGHT_VERSION: &str = env!("PLAYWRIGHT_DRIVER_VERSION");
+
 /// Default timeout in milliseconds for Playwright operations.
 ///
 /// This matches Playwright's standard default across all language implementations (Python, Java, .NET, JS).
@@ -171,20 +183,26 @@ pub const DEFAULT_TIMEOUT_MS: f64 = 30000.0;
 pub use error::{Error, Result};
 
 // Re-export assertions API
-pub use assertions::expect;
+pub use assertions::{
+    Animations, PageExpectation, ScreenshotAssertionOptions, ScreenshotAssertionOptionsBuilder,
+    expect, expect_page,
+};
 
 // Re-export Playwright main entry point and browser API
 pub use protocol::{Browser, BrowserContext, BrowserType, Page, Playwright, Response};
 
 // Re-export Locator and element APIs
-pub use protocol::{ElementHandle, Locator};
+pub use protocol::{
+    AriaRole, BoundingBox, ElementHandle, FilterOptions, GetByRoleOptions, Locator,
+};
 
 // Re-export navigation and page options
 pub use protocol::{GotoOptions, WaitUntil};
 
 // Re-export action options
 pub use protocol::{
-    CheckOptions, ClickOptions, FillOptions, HoverOptions, PressOptions, SelectOptions,
+    CheckOptions, ClickOptions, FillOptions, HoverOptions, PressOptions, PressSequentiallyOptions,
+    SelectOptions,
 };
 
 // Re-export form and input types
@@ -193,11 +211,20 @@ pub use protocol::{FilePayload, SelectOption};
 // Re-export screenshot types
 pub use protocol::{ScreenshotClip, ScreenshotOptions, ScreenshotType};
 
-// Re-export browser context options
-pub use protocol::{BrowserContextOptions, Geolocation, Viewport};
+// Re-export new page method types
+pub use protocol::{
+    AddScriptTagOptions, ColorScheme, EmulateMediaOptions, ForcedColors, Media, PdfMargin,
+    PdfOptions, ReducedMotion,
+};
+
+// Re-export browser context options and storage state types
+pub use protocol::{
+    BrowserContextOptions, Cookie, Geolocation, LocalStorageItem, Origin, RecordHar, RecordVideo,
+    StorageState, Viewport,
+};
 
 // Re-export routing types
-pub use protocol::{FulfillOptions, Route};
+pub use protocol::{FetchOptions, FetchResponse, FulfillOptions, Route, UnrouteBehavior};
 
-// Re-export launch options
-pub use api::LaunchOptions;
+// Re-export launch and connection options
+pub use api::{ConnectOverCdpOptions, LaunchOptions};

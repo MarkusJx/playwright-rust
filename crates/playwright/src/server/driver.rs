@@ -265,11 +265,11 @@ mod tests {
         let result = find_node_executable();
         match result {
             Ok(node_path) => {
-                println!("Found node at: {:?}", node_path);
+                tracing::info!("Found node at: {:?}", node_path);
                 assert!(node_path.exists());
             }
             Err(e) => {
-                println!(
+                tracing::warn!(
                     "Node.js not found (expected if Node.js not installed): {:?}",
                     e
                 );
@@ -284,15 +284,15 @@ mod tests {
         let result = get_driver_executable();
         match result {
             Ok((node, cli)) => {
-                println!("Found Playwright driver:");
-                println!("  Node: {:?}", node);
-                println!("  CLI:  {:?}", cli);
+                tracing::info!("Found Playwright driver:");
+                tracing::info!("  Node: {:?}", node);
+                tracing::info!("  CLI:  {:?}", cli);
                 assert!(node.exists());
                 assert!(cli.exists());
             }
             Err(Error::ServerNotFound) => {
-                println!("Playwright driver not found (expected in some environments)");
-                println!(
+                tracing::warn!("Playwright driver not found (expected in some environments)");
+                tracing::warn!(
                     "This is OK - driver will be bundled at build time or can be installed via npm"
                 );
             }
@@ -306,14 +306,14 @@ mod tests {
         let result = try_bundled_driver();
         match result {
             Ok(Some((node, cli))) => {
-                println!("Found bundled driver:");
-                println!("  Node: {:?}", node);
-                println!("  CLI:  {:?}", cli);
+                tracing::info!("Found bundled driver:");
+                tracing::info!("  Node: {:?}", node);
+                tracing::info!("  CLI:  {:?}", cli);
                 assert!(node.exists());
                 assert!(cli.exists());
             }
             Ok(None) => {
-                println!("No bundled driver (expected during development)");
+                tracing::info!("No bundled driver (expected during development)");
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
         }

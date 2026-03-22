@@ -28,6 +28,25 @@ pub enum Error {
     #[error("Server error: {0}")]
     ServerError(String),
 
+    /// Browser is not installed
+    ///
+    /// The specified browser has not been installed using Playwright's installation command.
+    /// To resolve this, install browsers using the versioned install command to ensure compatibility.
+    #[error(
+        "Browser '{browser_name}' is not installed.\n\n\
+        {message}\n\n\
+        To install {browser_name}, run:\n  \
+        npx playwright@{playwright_version} install {browser_name}\n\n\
+        Or install all browsers:\n  \
+        npx playwright@{playwright_version} install\n\n\
+        See: https://playwright.dev/docs/browsers"
+    )]
+    BrowserNotInstalled {
+        browser_name: String,
+        message: String,
+        playwright_version: String,
+    },
+
     /// Failed to establish connection with the server
     #[error("Failed to connect to Playwright server: {0}")]
     ConnectionFailed(String),
@@ -95,4 +114,22 @@ pub enum Error {
     /// Assertion timeout (expect API)
     #[error("Assertion timeout: {0}")]
     AssertionTimeout(String),
+    /// Object not found in registry (may have been closed/disposed)
+    #[error("Object not found (may have been closed): {0}")]
+    ObjectNotFound(String),
+
+    /// Invalid path provided
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
+
+    /// Error with additional context
+    #[error("{0}: {1}")]
+    Context(String, #[source] Box<Error>),
+}
+
+impl Error {
+    /// Adds context to the error
+    pub fn context(self, msg: impl Into<String>) -> Self {
+        Error::Context(msg.into(), Box::new(self))
+    }
 }
